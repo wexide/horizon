@@ -282,14 +282,18 @@ impl FrameUniforms {
         let dt = self.last.map_or(0.0, |l| (now - l).as_secs_f32());
         self.last = Some(now);
         let aspect = size[0] as f32 / size[1].max(1) as f32;
-        let view = crate::camera::view_matrix(frame.yaw, frame.pitch);
+        // The view bob (and the nausea spin) go in the model-view matrix, not the projection
+        // where vanilla multiplies them: packs rebuild view positions from the projection's
+        // diagonal and last column alone (`diagonal3(m) * v + m[3].xyz`), which a bob's
+        // rotation and offset there would leave out, so shadows and fog swayed with each step.
+        // Their product, what geometry is drawn with, is the same.
+        let view = frame.bob * frame.spin * crate::camera::view_matrix(frame.yaw, frame.pitch);
         let projection = Mat4::perspective_rh_gl(
             frame.fov_degrees.to_radians(),
             aspect,
             0.05,
             frame.depth_far,
-        ) * frame.bob
-            * frame.spin;
+        );
         let camera = frame.camera.as_vec3();
         let (previous_camera, previous_view, previous_projection) =
             self.previous

@@ -102,6 +102,12 @@ pub const TRANSLUCENT_BLEND: Blend = [
     Factor::OneMinusSrcAlpha,
 ];
 
+/// The alpha test of opaque terrain, as the game's own terrain shader cuts it.
+const TERRAIN_CUTOUT: crate::AlphaTest = crate::AlphaTest {
+    op: ">=",
+    reference: 0.5,
+};
+
 /// `gbuffers_water` and its fallbacks (2.3).
 const WATER: [&str; 5] = [
     "gbuffers_water",
@@ -454,8 +460,19 @@ pub fn load_post(
             p.blend = blend(properties, &p.name).flatten();
             p
         });
+    // Opaque terrain keeps the game's cutout (terrain.wgsl `fs_solid`): grass, flowers and
+    // leaves lose their transparent texels, in the pack's terrain and shadow programs alike.
+    let terrain_cut = inputs.terrain.as_ref().map(|i| {
+        let mut i = i.clone();
+        i.alpha_test = i.alpha_test.or(Some(TERRAIN_CUTOUT));
+        i
+    });
     if let Some(inputs) = &inputs.terrain {
-        let terrain = gbuffers(&TERRAIN, Group::Gbuffers, inputs);
+        let terrain = gbuffers(
+            &TERRAIN,
+            Group::Gbuffers,
+            terrain_cut.as_ref().unwrap_or(inputs),
+        );
         // gbuffers_water falls back to gbuffers_terrain's chain (2.3).
         let water = gbuffers(&WATER, Group::Translucent, inputs);
         loader.post.terrain = terrain;
@@ -488,6 +505,7 @@ pub fn load_post(
     load_shadow(
         &mut loader,
         inputs.terrain.as_ref(),
+        terrain_cut.as_ref(),
         inputs.entities.as_ref(),
     );
     post.config = std::mem::take(&mut post.config).finish();
@@ -500,6 +518,7 @@ pub fn load_post(
 fn load_shadow(
     loader: &mut Loader<'_>,
     terrain: Option<&GbuffersInputs>,
+    terrain_cut: Option<&GbuffersInputs>,
     entities: Option<&GbuffersInputs>,
 ) {
     let post = &*loader.post;
@@ -560,7 +579,7 @@ fn load_shadow(
     let only_player = !keep("shadowEntities") && set("shadowPlayer");
     let only_lit = !keep("shadowBlockEntities") && set("shadowLightBlockEntities");
     let shadow = keep("shadowTerrain")
-        .then(|| load(&["shadow"], terrain))
+        .then(|| load(&["shadow"], terrain_cut))
         .flatten();
     let water = keep("shadowTranslucent")
         .then(|| load(&["shadow_water", "shadow"], terrain))
