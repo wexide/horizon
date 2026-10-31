@@ -18,7 +18,7 @@
 //! Composite-style programs draw one quad from (0,0) to (1,1) with an identity model-view and an
 //! orthographic projection onto it, the texture coordinate equal to the position (OQ-6).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write;
 
 use naga::ShaderStage;
@@ -571,7 +571,7 @@ fn compile(stage: &Stage, text: &str, header_lines: usize) -> Result<naga::Modul
             },
         }
     };
-    let module = Frontend::default()
+    let mut module = Frontend::default()
         .parse(&Options::from(stage.kind), text)
         .map_err(|e| {
             e.errors
@@ -579,6 +579,7 @@ fn compile(stage: &Stage, text: &str, header_lines: usize) -> Result<naga::Modul
                 .map(|e| at(e.meta, e.kind.to_string()))
                 .collect::<Vec<_>>()
         })?;
+    copy_pointer_arguments(&mut module);
     Validator::new(ValidationFlags::all(), Capabilities::all())
         .validate(&module)
         .map_err(|e| {
@@ -594,6 +595,134 @@ fn compile(stage: &Stage, text: &str, header_lines: usize) -> Result<naga::Modul
             vec![at(span, message)]
         })?;
     Ok(module)
+}
+
+/// `f(v.z)` or `f(a[i])` for an `out`/`inout` parameter: naga's GLSL frontend passes a pointer
+/// into the vector or array, which SPIR-V does not take as an argument (its backend panics,
+/// "Expression [n] is not cached"). The argument is copied into a local of ours before the
+/// call and back after it, as GLSL's `inout` copies.
+fn copy_pointer_arguments(module: &mut naga::Module) {
+    let params: HashMap<naga::Handle<naga::Function>, Vec<Option<naga::Handle<naga::Type>>>> =
+        module
+            .functions
+            .iter()
+            .map(|(h, f)| {
+                let pointees = f.arguments.iter().map(|a| match module.types[a.ty].inner {
+                    naga::TypeInner::Pointer { base, .. } => Some(base),
+                    _ => None,
+                });
+                (h, pointees.collect())
+            })
+            .collect();
+    let fix = |f: &mut naga::Function| {
+        let body = std::mem::take(&mut f.body);
+        f.body = copy_in_block(body, f, &params);
+    };
+    for (_, f) in module.functions.iter_mut() {
+        fix(f);
+    }
+    for ep in &mut module.entry_points {
+        fix(&mut ep.function);
+    }
+}
+
+fn copy_in_block(
+    block: naga::Block,
+    f: &mut naga::Function,
+    params: &HashMap<naga::Handle<naga::Function>, Vec<Option<naga::Handle<naga::Type>>>>,
+) -> naga::Block {
+    use naga::{Expression as X, Statement as S};
+    let mut out = naga::Block::with_capacity(block.len());
+    for (statement, span) in block.span_into_iter() {
+        let statement = match statement {
+            S::Block(b) => S::Block(copy_in_block(b, f, params)),
+            S::If {
+                condition,
+                accept,
+                reject,
+            } => S::If {
+                condition,
+                accept: copy_in_block(accept, f, params),
+                reject: copy_in_block(reject, f, params),
+            },
+            S::Switch { selector, cases } => S::Switch {
+                selector,
+                cases: cases
+                    .into_iter()
+                    .map(|mut c| {
+                        c.body = copy_in_block(c.body, f, params);
+                        c
+                    })
+                    .collect(),
+            },
+            S::Loop {
+                body,
+                continuing,
+                break_if,
+            } => S::Loop {
+                body: copy_in_block(body, f, params),
+                continuing: copy_in_block(continuing, f, params),
+                break_if,
+            },
+            S::Call {
+                function,
+                mut arguments,
+                result,
+            } => {
+                let mut back = Vec::new();
+                for (i, argument) in arguments.iter_mut().enumerate() {
+                    let Some(&Some(ty)) = params.get(&function).and_then(|p| p.get(i)) else {
+                        continue;
+                    };
+                    if !matches!(
+                        f.expressions[*argument],
+                        X::Access { .. } | X::AccessIndex { .. }
+                    ) {
+                        continue;
+                    }
+                    let local = f.local_variables.append(
+                        naga::LocalVariable {
+                            name: None,
+                            ty,
+                            init: None,
+                        },
+                        span,
+                    );
+                    let temp = f.expressions.append(X::LocalVariable(local), span);
+                    let start = f.expressions.len();
+                    let value = f.expressions.append(X::Load { pointer: *argument }, span);
+                    out.push(S::Emit(f.expressions.range_from(start)), span);
+                    out.push(
+                        S::Store {
+                            pointer: temp,
+                            value,
+                        },
+                        span,
+                    );
+                    back.push((*argument, temp));
+                    *argument = temp;
+                }
+                out.push(
+                    S::Call {
+                        function,
+                        arguments,
+                        result,
+                    },
+                    span,
+                );
+                for (pointer, temp) in back {
+                    let start = f.expressions.len();
+                    let value = f.expressions.append(X::Load { pointer: temp }, span);
+                    out.push(S::Emit(f.expressions.range_from(start)), span);
+                    out.push(S::Store { pointer, value }, span);
+                }
+                continue;
+            }
+            other => other,
+        };
+        out.push(statement, span);
+    }
+    out
 }
 
 /// The uniform block's size and member offsets, from naga's layout.

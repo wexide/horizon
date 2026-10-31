@@ -71,8 +71,15 @@ impl Game<'_> {
                 match Pack::open(&path) {
                     Ok(pack) => {
                         let macros = Macros::standard();
+                        // The `.properties` files test the pack's options too (`#if defined
+                        // WATER_ON_CAMERA_EFFECT` around a custom uniform): the switches on by
+                        // default are defined for them.
+                        let mut option_macros = macros.clone();
+                        for switch in horizon_shaders::switches_on(&pack) {
+                            option_macros.define(switch, "");
+                        }
                         let text = pack.read_text("shaders.properties").unwrap_or_default();
-                        let properties = Properties::parse(&text, &macros);
+                        let properties = Properties::parse(&text, &option_macros);
                         for note in &properties.notes {
                             log::warn!(
                                 "shader pack {name}: shaders.properties:{}: {}",
@@ -88,18 +95,18 @@ impl Game<'_> {
                             biomes.list.iter().map(|b| b.name.as_str()).collect();
                         post.custom.set_biomes(&names);
                         let text = pack.read_text("block.properties").unwrap_or_default();
-                        let ids = BlockIds::parse(&Properties::parse(&text, &macros));
+                        let ids = BlockIds::parse(&Properties::parse(&text, &option_macros));
                         for note in &ids.notes {
                             log::warn!("shader pack {name}: block.properties: {note}");
                         }
                         let text = pack.read_text("entity.properties");
                         let entities = BlockIds::parse_kind(
-                            &Properties::parse(text.as_deref().unwrap_or_default(), &macros),
+                            &Properties::parse(text.as_deref().unwrap_or_default(), &option_macros),
                             "entity",
                         );
                         let text = pack.read_text("item.properties");
                         let items = BlockIds::parse_kind(
-                            &Properties::parse(text.as_deref().unwrap_or_default(), &macros),
+                            &Properties::parse(text.as_deref().unwrap_or_default(), &option_macros),
                             "item",
                         );
                         self.pack_ids = Some(PackIds {
