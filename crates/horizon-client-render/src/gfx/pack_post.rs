@@ -42,6 +42,8 @@ enum Source {
     Specular,
     /// The pack's own texture (`texture.<stage>.<sampler>`), by index.
     Custom(usize),
+    /// A 1×1×1 stand-in behind a `sampler3D` the pack has no texture for.
+    Dummy3d,
     Lightmap,
     /// `shadowtex0`/`shadowtex1` (6.3), with depth comparison (`sampler2DShadow`) or not.
     ShadowDepth(usize, bool),
@@ -81,7 +83,7 @@ impl SamplerKind {
             Source::Shadow | Source::ShadowDepth(_, true) => Self::Comparison,
             // Blocks look as the game draws them: nearest texels.
             Source::Atlas | Source::Normals | Source::Specular => Self::NearestRepeat,
-            Source::Custom(_) => Self::Repeat,
+            Source::Custom(_) | Source::Dummy3d => Self::Repeat,
             Source::Color(_) | Source::ShadowColor(_) | Source::Dummy | Source::Lightmap => {
                 Self::Linear
             }
@@ -322,6 +324,7 @@ pub struct PackPost {
     dummy: wgpu::TextureView,
     /// The pack's `texture.<stage>.<sampler>` textures (`Source::Custom`).
     custom_textures: Vec<wgpu::TextureView>,
+    dummy3d: wgpu::TextureView,
     normals: wgpu::TextureView,
     specular: wgpu::TextureView,
     /// The stand-in shadow map and its comparison sampler; cleared on the first frame.
@@ -500,6 +503,61 @@ fn sampler(
     })
 }
 
+/// An RGBA8 3D texture of `size` from `texels`, rows, then slices.
+fn volume_texture(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    label: &str,
+    [width, height, depth]: [u32; 3],
+    texels: &[u8],
+) -> wgpu::TextureView {
+    let size = wgpu::Extent3d {
+        width,
+        height,
+        depth_or_array_layers: depth,
+    };
+    let tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D3,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    queue.write_texture(
+        tex.as_image_copy(),
+        texels,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(width * 4),
+            rows_per_image: Some(height),
+        },
+        size,
+    );
+    tex.create_view(&Default::default())
+}
+
+/// Texels of `channels` bytes as RGBA8, as GL reads `RED`, `RG` and `RGB` (missing colour
+/// channels 0, alpha 1).
+fn expand_rgba(bytes: &[u8], channels: u8, texels: usize) -> Vec<u8> {
+    let c = usize::from(channels);
+    bytes
+        .chunks_exact(c)
+        .take(texels)
+        .flat_map(|t| {
+            let at = |i: usize| t.get(i).copied();
+            [
+                t[0],
+                at(1).unwrap_or(0),
+                at(2).unwrap_or(0),
+                if c == 4 { t[3] } else { 255 },
+            ]
+        })
+        .collect()
+}
+
 /// A pack's PNG as RGBA8 texels and its size; `None` for what this cannot read.
 fn decode_png(bytes: &[u8]) -> Option<([u32; 2], Vec<u8>)> {
     let mut decoder = png::Decoder::new(std::io::Cursor::new(bytes));
@@ -616,11 +674,19 @@ fn entry(binding: u32, ty: wgpu::BindingType) -> wgpu::BindGroupLayoutEntry {
 }
 
 fn texture_entry(binding: u32, sample_type: wgpu::TextureSampleType) -> wgpu::BindGroupLayoutEntry {
+    volume_entry(binding, sample_type, wgpu::TextureViewDimension::D2)
+}
+
+fn volume_entry(
+    binding: u32,
+    sample_type: wgpu::TextureSampleType,
+    view_dimension: wgpu::TextureViewDimension,
+) -> wgpu::BindGroupLayoutEntry {
     entry(
         binding,
         wgpu::BindingType::Texture {
             sample_type,
-            view_dimension: wgpu::TextureViewDimension::D2,
+            view_dimension,
             multisampled: false,
         },
     )
@@ -763,7 +829,7 @@ fn build_pass(
     notes: &mut Vec<String>,
     geometry: Option<&Geometry<'_>>,
     custom: &[String],
-    textures: &[(String, String)],
+    textures: &[(String, String, bool)],
     draws: &wgpu::BindGroupLayout,
 ) -> Option<Pass> {
     let features = device.features();
@@ -805,8 +871,19 @@ fn build_pass(
                 || horizon_shaders::buffer_index(n)
                     .is_some_and(|b| horizon_shaders::buffer_index(&s.name) == Some(b))
         };
-        if let Some(i) = textures.iter().position(|(st, n)| st == stage && named(n)) {
+        let three_d = s.ty == "sampler3D";
+        if let Some(i) = textures
+            .iter()
+            .position(|(st, n, d)| st == stage && named(n) && *d == three_d)
+        {
             src = Source::Custom(i);
+        } else if three_d {
+            // Nothing 3D of the game's has a sampler name: a stand-in keeps the pass whole.
+            notes.push(format!(
+                "{}: `{} {}` is not provided yet",
+                p.name, s.ty, s.name
+            ));
+            src = Source::Dummy3d;
         }
         let blank = match src {
             // The shadow pass writes the shadow map.
@@ -842,7 +919,7 @@ fn build_pass(
             sample_type = wgpu::TextureSampleType::Depth;
         }
         let wanted = match s.ty.as_str() {
-            "sampler2DShadow" => true,
+            "sampler2DShadow" | "sampler3D" => true,
             "sampler2D" => !int,
             "isampler2D" => sample_type == wgpu::TextureSampleType::Sint,
             "usampler2D" => sample_type == wgpu::TextureSampleType::Uint,
@@ -870,7 +947,12 @@ fn build_pass(
             Source::ShadowColor(n) => shadow_reads |= 1 << n,
             _ => {}
         }
-        entries.push(texture_entry(s.binding, sample_type));
+        let dimension = if three_d {
+            wgpu::TextureViewDimension::D3
+        } else {
+            wgpu::TextureViewDimension::D2
+        };
+        entries.push(volume_entry(s.binding, sample_type, dimension));
         let kind = SamplerKind::of(src, filtering);
         let sampler = *kinds.entry(kind).or_insert_with(|| {
             entries.push(entry(
@@ -1072,8 +1154,26 @@ impl PackPost {
         let mut custom_textures = Vec::new();
         for t in &post.custom_textures {
             let label = format!("texture.{}.{}", t.stage, t.name);
-            if let Some(view) = decode(&label, &t.png, &mut notes) {
-                texture_names.push((t.stage.clone(), t.name.clone()));
+            let (view, three_d) = match &t.data {
+                horizon_shaders::TextureData::Png(png) => (decode(&label, png, &mut notes), false),
+                horizon_shaders::TextureData::Raw {
+                    size,
+                    three_d,
+                    channels,
+                    bytes,
+                } => {
+                    let texels = size.iter().map(|&n| n as usize).product();
+                    let rgba = expand_rgba(bytes, *channels, texels);
+                    let view = if *three_d {
+                        volume_texture(device, queue, &label, *size, &rgba)
+                    } else {
+                        sized_texture(device, queue, &label, [size[0], size[1]], &rgba)
+                    };
+                    (Some(view), *three_d)
+                }
+            };
+            if let Some(view) = view {
+                texture_names.push((t.stage.clone(), t.name.clone(), three_d));
                 custom_textures.push(view);
             }
         }
@@ -1081,7 +1181,10 @@ impl PackPost {
         let mut custom = post.custom;
         let custom_names: Vec<String> = custom.uniforms().map(|u| u.0.to_owned()).collect();
         // A first run finds the names neither the frame nor the pack defines.
-        custom.eval(0.0, &|n| pack_uniforms::index(n).map(|_| Val::scalar(0.0)));
+        custom.eval(0.0, &|n| {
+            (pack_uniforms::index(n).is_some() || pack_uniforms::PLAYER_FLAGS.contains(&n))
+                .then(|| Val::scalar(0.0))
+        });
         if !custom.notes.is_empty() {
             notes.push(format!("custom uniforms: {}", custom.notes.join("; ")));
             custom.notes.clear();
@@ -1542,6 +1645,7 @@ impl PackPost {
             targets: None,
             noise: pack_noise.unwrap_or_else(|| noise(device, queue)),
             custom_textures,
+            dummy3d: volume_texture(device, queue, "Shader pack 3D stand-in", [1, 1, 1], &white),
             dummy: texture(device, queue, "Shader pack stand-in", 1, &white),
             normals: texture(
                 device,
@@ -1694,6 +1798,7 @@ impl PackPost {
                     Source::Dummy => &self.dummy,
                     Source::Normals => &self.normals,
                     Source::Custom(i) => self.custom_textures.get(i).unwrap_or(&self.dummy),
+                    Source::Dummy3d => &self.dummy3d,
                     Source::Specular => &self.specular,
                     Source::Shadow => &self.shadow.0,
                     Source::Atlas => pass

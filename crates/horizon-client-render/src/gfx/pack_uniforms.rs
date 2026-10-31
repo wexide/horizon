@@ -33,7 +33,13 @@ pub struct PackInputs {
     /// `heldItemId`, `heldItemId2` (item.properties, 5.3) and `heldBlockLightValue(2)`.
     pub held_items: [i32; 2],
     pub held_light: [i32; 2],
+    /// The player has health left (custom uniforms' `is_alive`).
+    pub alive: bool,
 }
+
+/// The player's flags custom uniforms read (`uniform.bool.isDead = !is_alive`) that the frame's
+/// uniforms do not hold.
+pub const PLAYER_FLAGS: [&str; 1] = ["is_alive"];
 
 /// One uniform's value: up to 16 floats or 3 integers.
 #[derive(Clone, Copy, Debug)]
@@ -175,6 +181,8 @@ pub struct FrameUniforms {
     eye_smooth: [f32; 2],
     /// The pack's shadow settings (7.1).
     pub shadow: Shadow,
+    /// This frame's `is_alive`.
+    alive: bool,
 }
 
 impl Default for FrameUniforms {
@@ -189,6 +197,7 @@ impl Default for FrameUniforms {
             wetness: 0.0,
             eye_smooth: [0.0; 2],
             shadow: Shadow::default(),
+            alive: true,
         }
     }
 }
@@ -278,6 +287,7 @@ fn smooth(value: f32, target: f32, half_life: f32, dt: f32) -> f32 {
 impl FrameUniforms {
     /// This frame's values for a render size of `size` pixels.
     pub fn update(&mut self, frame: &Frame, inputs: &PackInputs, size: [u32; 2]) {
+        self.alive = inputs.alive;
         let now = std::time::Instant::now();
         let dt = self.last.map_or(0.0, |l| (now - l).as_secs_f32());
         self.last = Some(now);
@@ -431,7 +441,11 @@ impl FrameUniforms {
     pub fn eval_custom(&mut self, custom: &mut horizon_shaders::Custom) {
         self.values.truncate(NAMES.len());
         let values = &self.values;
+        let alive = self.alive;
         let builtin = |name: &str| {
+            if name == "is_alive" {
+                return Some(horizon_shaders::Val::scalar(f64::from(u8::from(alive))));
+            }
             let v = values.get(index(name)?)?;
             let n = components(name);
             Some(match *v {

@@ -530,12 +530,27 @@ pub fn load_post(
 pub struct CustomTexture {
     pub stage: String,
     pub name: String,
-    pub png: Vec<u8>,
+    pub data: TextureData,
+}
+
+/// What a custom texture holds: a PNG, or raw texels (`path TEXTURE_3D RGBA8 128 128 128 RGBA
+/// UNSIGNED_BYTE`) of one byte per channel, `channels` per texel, rows first, then slices; a
+/// 2D texture has a depth of 1.
+#[derive(Clone, Debug, PartialEq)]
+pub enum TextureData {
+    Png(Vec<u8>),
+    Raw {
+        size: [u32; 3],
+        three_d: bool,
+        channels: u8,
+        bytes: Vec<u8>,
+    },
 }
 
 /// `texture.noise` and `texture.<stage>.<sampler>` naming PNG files of the pack, from its
-/// `shaders` folder (a leading `/` is the same). Resource-pack locations (`minecraft:...`) and
-/// raw textures are not read yet: those samplers keep what the game binds.
+/// `shaders` folder (a leading `/` is the same), or raw files of byte channels. Resource-pack
+/// locations (`minecraft:...`) and other raw kinds are not read yet: those samplers keep what
+/// the game binds.
 fn custom_textures(loader: &mut Loader<'_>) {
     const STAGES: [&str; 6] = [
         "gbuffers",
@@ -554,27 +569,76 @@ fn custom_textures(loader: &mut Loader<'_>) {
             Some((stage, name)) if STAGES.contains(&stage) => Some((stage, name)),
             _ => continue,
         };
-        let path = e.value.split_whitespace().next().unwrap_or_default();
-        let path = path.trim_start_matches('/');
-        let png = (!path.contains(':') && path.ends_with(".png"))
-            .then(|| loader.pack.read(path))
-            .flatten();
-        let Some(png) = png else {
+        let data = texture_data(loader.pack, &e.value);
+        let Some(data) = data else {
             loader.post.notes.push(format!(
                 "{}: `{}` is not read yet; the game's texture stays",
                 e.key, e.value
             ));
             continue;
         };
-        match target {
-            None => loader.post.noise_texture = Some(png),
-            Some((stage, name)) => loader.post.custom_textures.push(CustomTexture {
+        match (target, data) {
+            (None, TextureData::Png(png)) => loader.post.noise_texture = Some(png),
+            (Some((stage, name)), data) => loader.post.custom_textures.push(CustomTexture {
                 stage: stage.to_owned(),
                 name: name.to_owned(),
-                png,
+                data,
             }),
+            (None, TextureData::Raw { .. }) => loader
+                .post
+                .notes
+                .push(format!("{}: a raw noise texture is not read yet", e.key)),
         }
     }
+}
+
+/// A custom texture's value read from the pack, or `None` for what is not read yet.
+fn texture_data(pack: &Pack, value: &str) -> Option<TextureData> {
+    let mut words = value.split_whitespace();
+    let path = words.next()?.trim_start_matches('/');
+    if path.contains(':') {
+        return None;
+    }
+    let rest: Vec<&str> = words.collect();
+    if rest.is_empty() {
+        return path
+            .ends_with(".png")
+            .then(|| pack.read(path))
+            .flatten()
+            .map(TextureData::Png);
+    }
+    // `TEXTURE_2D <internal> w h <format> <type>` or `TEXTURE_3D <internal> w h d <format> <type>`.
+    let three_d = match rest[0] {
+        "TEXTURE_2D" => false,
+        "TEXTURE_3D" => true,
+        _ => return None,
+    };
+    let dims = if three_d { 3 } else { 2 };
+    if rest.len() != 2 + dims + 2 || rest[2 + dims + 1] != "UNSIGNED_BYTE" {
+        return None;
+    }
+    let mut size = [1u32; 3];
+    for (d, word) in size.iter_mut().zip(&rest[2..2 + dims]) {
+        *d = word.parse().ok().filter(|&n| n > 0)?;
+    }
+    let channels = match rest[2 + dims] {
+        "RED" | "R" => 1,
+        "RG" => 2,
+        "RGB" => 3,
+        "RGBA" => 4,
+        _ => return None,
+    };
+    let bytes = pack.read(path)?;
+    let texels = size.iter().map(|&n| n as usize).product::<usize>();
+    if bytes.len() < texels * channels as usize {
+        return None;
+    }
+    Some(TextureData::Raw {
+        size,
+        three_d,
+        channels,
+        bytes,
+    })
 }
 
 /// Whether the shadow pass runs (2.5) and, when it does, its programs: `shadow_solid` and
@@ -1159,6 +1223,7 @@ mod tests {
             crate::pack::tests::zip(&[
                 ("shaders/textures/noise.png", "N"),
                 ("shaders/textures/blue.png", "B"),
+                ("shaders/textures/cloud.bin", "abcdefghijklmnopqrstuvwx"),
             ]),
         )
         .unwrap();
@@ -1167,23 +1232,41 @@ mod tests {
             "texture.noise = textures/noise.png\n\
              texture.composite.colortex6 = /textures/blue.png\n\
              texture.deferred.gaux1 = minecraft:textures/atlas/blocks.png\n\
-             texture.nowhere.colortex2 = textures/blue.png\n",
+             texture.nowhere.colortex2 = textures/blue.png\n\
+             texture.deferred.colortex4 = textures/cloud.bin TEXTURE_3D RGB8 2 2 2 RGB UNSIGNED_BYTE\n\
+             texture.deferred.colortex5 = textures/cloud.bin TEXTURE_3D RGBA32F 2 2 2 RGBA FLOAT\n",
             &macros,
         );
         let post = load_post(&pack, "", &properties, &macros, &GameInputs::default());
         assert_eq!(post.noise_texture.as_deref(), Some(&b"N"[..]));
         assert_eq!(
             post.custom_textures,
-            [CustomTexture {
-                stage: "composite".into(),
-                name: "colortex6".into(),
-                png: b"B".to_vec(),
-            }]
+            [
+                CustomTexture {
+                    stage: "composite".into(),
+                    name: "colortex6".into(),
+                    data: TextureData::Png(b"B".to_vec()),
+                },
+                CustomTexture {
+                    stage: "deferred".into(),
+                    name: "colortex4".into(),
+                    data: TextureData::Raw {
+                        size: [2, 2, 2],
+                        three_d: true,
+                        channels: 3,
+                        bytes: b"abcdefghijklmnopqrstuvwx".to_vec(),
+                    },
+                },
+            ]
         );
         assert!(
             post.notes
                 .iter()
-                .any(|n| n.starts_with("texture.deferred.gaux1")),
+                .any(|n| n.starts_with("texture.deferred.gaux1"))
+                && post
+                    .notes
+                    .iter()
+                    .any(|n| n.starts_with("texture.deferred.colortex5")),
             "{:?}",
             post.notes
         );

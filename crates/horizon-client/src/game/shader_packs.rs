@@ -188,6 +188,7 @@ impl Game<'_> {
             rainfall: info.map_or(0.0, |b| b.downfall),
             held_items,
             held_light,
+            alive: self.player.as_ref().is_none_or(|p| p.health.health() > 0.0),
         }
     }
 
