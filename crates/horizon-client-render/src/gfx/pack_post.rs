@@ -40,6 +40,8 @@ enum Source {
     /// `_n` and `_s` textures are read, a 1×1 flat normal (0.5, 0.5, 1.0) and no specular.
     Normals,
     Specular,
+    /// The pack's own texture (`texture.<stage>.<sampler>`), by index.
+    Custom(usize),
     Lightmap,
     /// `shadowtex0`/`shadowtex1` (6.3), with depth comparison (`sampler2DShadow`) or not.
     ShadowDepth(usize, bool),
@@ -79,6 +81,7 @@ impl SamplerKind {
             Source::Shadow | Source::ShadowDepth(_, true) => Self::Comparison,
             // Blocks look as the game draws them: nearest texels.
             Source::Atlas | Source::Normals | Source::Specular => Self::NearestRepeat,
+            Source::Custom(_) => Self::Repeat,
             Source::Color(_) | Source::ShadowColor(_) | Source::Dummy | Source::Lightmap => {
                 Self::Linear
             }
@@ -271,7 +274,7 @@ pub struct PackPost {
     clouds: Option<Pass>,
     cloud_draw: Option<Clouds>,
     /// The pack has `gbuffers_clouds`, even one that writes nothing (a pack drawing its own
-    /// clouds discards vanilla's): the game's clouds are not drawn.
+    /// clouds discards vanilla's), or says `clouds=off`: the game's clouds are not drawn.
     hides_clouds: bool,
     /// What draws rain and snow (the same program, each with its kind's sprite as `texture`),
     /// after translucent terrain, this frame's weather and the sprites' generation bound.
@@ -317,6 +320,8 @@ pub struct PackPost {
     targets: Option<Targets>,
     noise: wgpu::TextureView,
     dummy: wgpu::TextureView,
+    /// The pack's `texture.<stage>.<sampler>` textures (`Source::Custom`).
+    custom_textures: Vec<wgpu::TextureView>,
     normals: wgpu::TextureView,
     specular: wgpu::TextureView,
     /// The stand-in shadow map and its comparison sampler; cleared on the first frame.
@@ -440,9 +445,20 @@ fn texture(
     side: u32,
     texels: &[u8],
 ) -> wgpu::TextureView {
+    sized_texture(device, queue, label, [side, side], texels)
+}
+
+/// An RGBA8 texture of `size` from `texels`, rows first to last as a PNG stores them.
+fn sized_texture(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    label: &str,
+    [width, height]: [u32; 2],
+    texels: &[u8],
+) -> wgpu::TextureView {
     let size = wgpu::Extent3d {
-        width: side,
-        height: side,
+        width,
+        height,
         depth_or_array_layers: 1,
     };
     let tex = device.create_texture(&wgpu::TextureDescriptor {
@@ -460,7 +476,7 @@ fn texture(
         texels,
         wgpu::TexelCopyBufferLayout {
             offset: 0,
-            bytes_per_row: Some(side * 4),
+            bytes_per_row: Some(width * 4),
             rows_per_image: None,
         },
         size,
@@ -482,6 +498,42 @@ fn sampler(
         min_filter: filter,
         ..Default::default()
     })
+}
+
+/// A pack's PNG as RGBA8 texels and its size; `None` for what this cannot read.
+fn decode_png(bytes: &[u8]) -> Option<([u32; 2], Vec<u8>)> {
+    let mut decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+    decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
+    let mut reader = decoder.read_info().ok()?;
+    let mut data = vec![0; reader.output_buffer_size()?];
+    let info = reader.next_frame(&mut data).ok()?;
+    let data = &data[..info.buffer_size()];
+    let rgba: Vec<u8> = match info.color_type {
+        png::ColorType::Rgba => data.to_vec(),
+        png::ColorType::Rgb => data
+            .chunks_exact(3)
+            .flat_map(|p| [p[0], p[1], p[2], 255])
+            .collect(),
+        png::ColorType::Grayscale => data.iter().flat_map(|&g| [g, g, g, 255]).collect(),
+        png::ColorType::GrayscaleAlpha => data
+            .chunks_exact(2)
+            .flat_map(|p| [p[0], p[0], p[0], p[1]])
+            .collect(),
+        png::ColorType::Indexed => return None,
+    };
+    Some(([info.width, info.height], rgba))
+}
+
+/// The stage `texture.<stage>.<sampler>` names for a program of `group`.
+fn texture_stage(group: Group) -> &'static str {
+    match group {
+        Group::Prepare => "prepare",
+        Group::Deferred => "deferred",
+        Group::Composite | Group::Final => "composite",
+        Group::Gbuffers | Group::Translucent => "gbuffers",
+        Group::Shadow => "shadow",
+        Group::ShadowComp => "shadowcomp",
+    }
 }
 
 /// Runs `create` and returns its validation error, if any. A panic while it runs is an error
@@ -711,6 +763,7 @@ fn build_pass(
     notes: &mut Vec<String>,
     geometry: Option<&Geometry<'_>>,
     custom: &[String],
+    textures: &[(String, String)],
     draws: &wgpu::BindGroupLayout,
 ) -> Option<Pass> {
     let features = device.features();
@@ -745,6 +798,16 @@ fn build_pass(
     };
     for s in &interface.samplers {
         let mut src = source(&s.name, p.group.shadow(), shadow.is_some(), watershadow);
+        // The pack's own texture for this stage's sampler (`gaux3` names `colortex6` too).
+        let stage = texture_stage(p.group);
+        let named = |n: &str| {
+            n == s.name
+                || horizon_shaders::buffer_index(n)
+                    .is_some_and(|b| horizon_shaders::buffer_index(&s.name) == Some(b))
+        };
+        if let Some(i) = textures.iter().position(|(st, n)| st == stage && named(n)) {
+            src = Source::Custom(i);
+        }
         let blank = match src {
             // The shadow pass writes the shadow map.
             Source::ShadowDepth(..) => p.group == Group::Shadow,
@@ -993,6 +1056,27 @@ impl PackPost {
         });
         let mut notes = post.notes;
         notes.extend(post.config.notes);
+        // The pack's own textures: `noisetex`, then those of `texture.<stage>.<sampler>`.
+        let decode = |label: &str, png: &[u8], notes: &mut Vec<String>| {
+            let decoded = decode_png(png);
+            if decoded.is_none() {
+                notes.push(format!("{label}: the PNG could not be read"));
+            }
+            decoded.map(|(size, texels)| sized_texture(device, queue, label, size, &texels))
+        };
+        let pack_noise = post
+            .noise_texture
+            .as_deref()
+            .and_then(|png| decode("texture.noise", png, &mut notes));
+        let mut texture_names = Vec::new();
+        let mut custom_textures = Vec::new();
+        for t in &post.custom_textures {
+            let label = format!("texture.{}.{}", t.stage, t.name);
+            if let Some(view) = decode(&label, &t.png, &mut notes) {
+                texture_names.push((t.stage.clone(), t.name.clone()));
+                custom_textures.push(view);
+            }
+        }
         let shadow_config = post.config.shadow.clone();
         let mut custom = post.custom;
         let custom_names: Vec<String> = custom.uniforms().map(|u| u.0.to_owned()).collect();
@@ -1027,6 +1111,7 @@ impl PackPost {
                 &mut notes,
                 geometry,
                 &custom_names,
+                &texture_names,
                 &draws.layout,
             )?;
             if !in_shadow {
@@ -1137,7 +1222,7 @@ impl PackPost {
             ids: None,
             cull: false,
         });
-        let hides_clouds = post.clouds.is_some() && cloud_geometry.is_some();
+        let hides_clouds = (post.clouds.is_some() && cloud_geometry.is_some()) || post.clouds_off;
         let weather_geometry = world.weather.then(|| Geometry {
             buffers: &entity_buffers,
             table: None,
@@ -1455,7 +1540,8 @@ impl PackPost {
             blit_group: None,
             main: 0,
             targets: None,
-            noise: noise(device, queue),
+            noise: pack_noise.unwrap_or_else(|| noise(device, queue)),
+            custom_textures,
             dummy: texture(device, queue, "Shader pack stand-in", 1, &white),
             normals: texture(
                 device,
@@ -1607,6 +1693,7 @@ impl PackPost {
                     Source::Noise => &self.noise,
                     Source::Dummy => &self.dummy,
                     Source::Normals => &self.normals,
+                    Source::Custom(i) => self.custom_textures.get(i).unwrap_or(&self.dummy),
                     Source::Specular => &self.specular,
                     Source::Shadow => &self.shadow.0,
                     Source::Atlas => pass

@@ -244,6 +244,12 @@ pub struct Post {
     pub particles: Option<PostProgram>,
     /// What draws the game's clouds.
     pub clouds: Option<PostProgram>,
+    /// `clouds=off` (3.2): the pack draws its own sky, so the game draws no clouds.
+    pub clouds_off: bool,
+    /// `texture.noise`: the PNG that replaces the game's `noisetex`.
+    pub noise_texture: Option<Vec<u8>>,
+    /// `texture.<stage>.<sampler>`: PNGs that replace a sampler in a stage's programs.
+    pub custom_textures: Vec<CustomTexture>,
     /// What draws rain and snow, after deferred.
     pub weather: Option<PostProgram>,
     /// What draws the first-person hand and held items.
@@ -327,6 +333,9 @@ pub fn load_post(
         entities_translucent: None,
         particles: None,
         clouds: None,
+        clouds_off: false,
+        noise_texture: None,
+        custom_textures: Vec::new(),
         weather: None,
         hand: None,
         shadow_pass: false,
@@ -491,6 +500,8 @@ pub fn load_post(
     loader.post.entities_translucent = entities_translucent;
     loader.post.particles = particles;
     loader.post.clouds = clouds;
+    loader.post.clouds_off = properties.get("clouds").is_some_and(|v| v.trim() == "off");
+    custom_textures(&mut loader);
     loader.post.weather = weather;
     loader.post.hand = hand;
     let flag = |key: &str| properties.get(key).map(|v| v.trim() == "true");
@@ -510,6 +521,60 @@ pub fn load_post(
     );
     post.config = std::mem::take(&mut post.config).finish();
     post
+}
+
+/// A pack's own texture for one sampler of one stage (`texture.composite.colortex6 =
+/// texture/blueNoise.png`): `stage` is `gbuffers`, `prepare`, `deferred`, `composite`
+/// (which `final` is part of), `shadow` or `shadowcomp`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CustomTexture {
+    pub stage: String,
+    pub name: String,
+    pub png: Vec<u8>,
+}
+
+/// `texture.noise` and `texture.<stage>.<sampler>` naming PNG files of the pack, from its
+/// `shaders` folder (a leading `/` is the same). Resource-pack locations (`minecraft:...`) and
+/// raw textures are not read yet: those samplers keep what the game binds.
+fn custom_textures(loader: &mut Loader<'_>) {
+    const STAGES: [&str; 6] = [
+        "gbuffers",
+        "prepare",
+        "deferred",
+        "composite",
+        "shadow",
+        "shadowcomp",
+    ];
+    for e in &loader.properties.entries {
+        let Some(rest) = e.key.strip_prefix("texture.") else {
+            continue;
+        };
+        let target = match rest.split_once('.') {
+            None if rest == "noise" => None,
+            Some((stage, name)) if STAGES.contains(&stage) => Some((stage, name)),
+            _ => continue,
+        };
+        let path = e.value.split_whitespace().next().unwrap_or_default();
+        let path = path.trim_start_matches('/');
+        let png = (!path.contains(':') && path.ends_with(".png"))
+            .then(|| loader.pack.read(path))
+            .flatten();
+        let Some(png) = png else {
+            loader.post.notes.push(format!(
+                "{}: `{}` is not read yet; the game's texture stays",
+                e.key, e.value
+            ));
+            continue;
+        };
+        match target {
+            None => loader.post.noise_texture = Some(png),
+            Some((stage, name)) => loader.post.custom_textures.push(CustomTexture {
+                stage: stage.to_owned(),
+                name: name.to_owned(),
+                png,
+            }),
+        }
+    }
 }
 
 /// Whether the shadow pass runs (2.5) and, when it does, its programs: `shadow_solid` and
@@ -1021,8 +1086,11 @@ mod tests {
         );
         assert_eq!(particles.blend, Some(TRANSLUCENT_BLEND));
         assert!(post.particles_late && !post.translucent_late);
-        // gbuffers_clouds has no fallback (OQ-3): without it the game draws its clouds.
-        assert!(post.clouds.is_none());
+        // gbuffers_clouds has no fallback (OQ-3): without it the game draws its clouds,
+        // unless `clouds=off` (Bliss draws its own).
+        assert!(post.clouds.is_none() && !post.clouds_off);
+        let off = Properties::parse("clouds=off\n", &macros);
+        assert!(load_post(&pack, "", &off, &macros, &inputs).clouds_off);
         // The hand falls back to gbuffers_textured and does not blend.
         let hand = post.hand.as_ref().unwrap();
         assert_eq!(
@@ -1079,6 +1147,45 @@ mod tests {
         assert_eq!(
             post.config.buffers[2].format,
             crate::Format::parse("RGBA16F").unwrap()
+        );
+    }
+
+    /// `texture.noise` and `texture.<stage>.<sampler>` read the pack's PNGs; other kinds of
+    /// texture are left to the game, with a note.
+    #[test]
+    fn custom_textures_are_read_from_the_pack() {
+        let pack = Pack::from_zip_bytes(
+            "P.zip",
+            crate::pack::tests::zip(&[
+                ("shaders/textures/noise.png", "N"),
+                ("shaders/textures/blue.png", "B"),
+            ]),
+        )
+        .unwrap();
+        let macros = Macros::standard();
+        let properties = Properties::parse(
+            "texture.noise = textures/noise.png\n\
+             texture.composite.colortex6 = /textures/blue.png\n\
+             texture.deferred.gaux1 = minecraft:textures/atlas/blocks.png\n\
+             texture.nowhere.colortex2 = textures/blue.png\n",
+            &macros,
+        );
+        let post = load_post(&pack, "", &properties, &macros, &GameInputs::default());
+        assert_eq!(post.noise_texture.as_deref(), Some(&b"N"[..]));
+        assert_eq!(
+            post.custom_textures,
+            [CustomTexture {
+                stage: "composite".into(),
+                name: "colortex6".into(),
+                png: b"B".to_vec(),
+            }]
+        );
+        assert!(
+            post.notes
+                .iter()
+                .any(|n| n.starts_with("texture.deferred.gaux1")),
+            "{:?}",
+            post.notes
         );
     }
 }
