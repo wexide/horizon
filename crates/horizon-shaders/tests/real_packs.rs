@@ -204,7 +204,12 @@ fn real_packs_read() {
                 custom.uniforms().count(),
                 custom.notes.iter().take(4).collect::<Vec<_>>()
             );
-            for n in post.notes.iter().chain(&post.config.notes).take(12) {
+            let shown = if std::env::var_os("SHOW_ERRORS").is_some() {
+                usize::MAX
+            } else {
+                12
+            };
+            for n in post.notes.iter().chain(&post.config.notes).take(shown) {
                 println!("    {n}");
             }
         }

@@ -629,12 +629,12 @@ impl Loader<'_> {
         }
         let vertex = preprocess(self.pack, &vsh, self.macros);
         let fragment = preprocess(self.pack, &fsh, self.macros);
-        let problems: Vec<String> = [&vertex, &fragment]
+        notes.extend([&vertex, &fragment].iter().flat_map(|pp| diagnostics(pp)));
+        // Only a problem the preprocessor could not go on from skips the program.
+        let fatal = [&vertex, &fragment]
             .iter()
-            .flat_map(|pp| diagnostics(pp))
-            .collect();
-        if !problems.is_empty() {
-            notes.extend(problems);
+            .any(|pp| pp.diagnostics.iter().any(|d| !d.recovered));
+        if fatal {
             notes.push(format!("{name}: skipped"));
             return None;
         }

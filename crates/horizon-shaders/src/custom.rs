@@ -116,7 +116,9 @@ impl Custom {
                     .push(format!("{}: type `{ty}` is not supported", e.key));
                 continue;
             }
-            match Parser::new(&e.value, &mut out.calls).expr_all() {
+            // `uniform.float.a = 0.0;`: a statement's `;` some packs end the value with.
+            let value = e.value.trim_end().trim_end_matches(';');
+            match Parser::new(value, &mut out.calls).expr_all() {
                 Ok(expr) => out.items.push(Item {
                     name: name.to_owned(),
                     ty: ty.to_owned(),

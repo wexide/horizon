@@ -36,6 +36,10 @@ enum Source {
     Shadow,
     /// The block atlas (pack_atlas.rs), in gbuffers programs.
     Atlas,
+    /// `normals` and `specular` (`MC_NORMAL_MAP`, `MC_SPECULAR_MAP`): until resource packs'
+    /// `_n` and `_s` textures are read, a 1×1 flat normal (0.5, 0.5, 1.0) and no specular.
+    Normals,
+    Specular,
     Lightmap,
     /// `shadowtex0`/`shadowtex1` (6.3), with depth comparison (`sampler2DShadow`) or not.
     ShadowDepth(usize, bool),
@@ -74,7 +78,7 @@ impl SamplerKind {
             Source::Noise => Self::Repeat,
             Source::Shadow | Source::ShadowDepth(_, true) => Self::Comparison,
             // Blocks look as the game draws them: nearest texels.
-            Source::Atlas => Self::NearestRepeat,
+            Source::Atlas | Source::Normals | Source::Specular => Self::NearestRepeat,
             Source::Color(_) | Source::ShadowColor(_) | Source::Dummy | Source::Lightmap => {
                 Self::Linear
             }
@@ -313,6 +317,8 @@ pub struct PackPost {
     targets: Option<Targets>,
     noise: wgpu::TextureView,
     dummy: wgpu::TextureView,
+    normals: wgpu::TextureView,
+    specular: wgpu::TextureView,
     /// The stand-in shadow map and its comparison sampler; cleared on the first frame.
     shadow: (wgpu::TextureView, wgpu::Sampler),
     shadow_cleared: bool,
@@ -407,6 +413,8 @@ fn source(name: &str, shadow_space: bool, shadow_pass: bool, watershadow: bool) 
         "noisetex" => Source::Noise,
         "texture" | "gtexture" | "tex" => Source::Atlas,
         "lightmap" => Source::Lightmap,
+        "normals" => Source::Normals,
+        "specular" => Source::Specular,
         n => horizon_shaders::buffer_index(n).map_or(Source::Dummy, Source::Color),
     }
 }
@@ -1449,6 +1457,14 @@ impl PackPost {
             targets: None,
             noise: noise(device, queue),
             dummy: texture(device, queue, "Shader pack stand-in", 1, &white),
+            normals: texture(
+                device,
+                queue,
+                "Shader pack normals",
+                1,
+                &[128, 128, 255, 255],
+            ),
+            specular: texture(device, queue, "Shader pack specular", 1, &[0; 4]),
             shadow: (
                 device
                     .create_texture(&wgpu::TextureDescriptor {
@@ -1590,6 +1606,8 @@ impl PackPost {
                     },
                     Source::Noise => &self.noise,
                     Source::Dummy => &self.dummy,
+                    Source::Normals => &self.normals,
+                    Source::Specular => &self.specular,
                     Source::Shadow => &self.shadow.0,
                     Source::Atlas => pass
                         .atlas

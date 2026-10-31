@@ -91,6 +91,10 @@ impl Macros {
         m.define("MC_SHADOW_QUALITY", "1.0");
         m.define("MC_HAND_DEPTH", "0.125");
         m.define("MAX_COLOR_BUFFERS", "16");
+        // The game binds `normals` and `specular` (flat and empty until resource packs' own
+        // are read), so packs take their normal and specular paths, which some always assume.
+        m.define("MC_NORMAL_MAP", "");
+        m.define("MC_SPECULAR_MAP", "");
         m
     }
 
@@ -124,6 +128,17 @@ impl Macros {
             .get(name)
             .filter(|m| m.params.is_none())
             .map(|m| m.body.as_str())
+    }
+
+    /// Whether `text` calls a function-like macro whose `)` is not on it: the call goes on over
+    /// the next lines (`saturate(a\n + b)`).
+    pub(crate) fn open_call(&self, text: &str) -> bool {
+        let tokens = lex(text);
+        tokens.iter().enumerate().any(|(i, t)| {
+            self.0.get(*t).is_some_and(|m| m.params.is_some())
+                && tokens[i + 1..].iter().find(|t| !t.trim().is_empty()) == Some(&"(")
+                && arguments(&tokens, i + 1).is_none()
+        })
     }
 
     /// `text` with every macro expanded, repeatedly; a macro is not expanded again inside its own

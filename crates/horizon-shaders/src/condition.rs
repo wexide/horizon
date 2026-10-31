@@ -199,7 +199,21 @@ fn tokens(expr: &str, macros: &Macros) -> Result<Vec<Token>, String> {
                 .find(|c: char| !c.is_ascii_alphanumeric())
                 .unwrap_or(rest.len());
             if rest[len..].starts_with('.') {
-                return Err(format!("`{}`: `#if` takes integers only", &rest[..len + 1]));
+                // `0.0` and `2.` are integers written as floats (`#if THRESHOLD == 0.0`);
+                // a fraction is not something `#if` can compare.
+                let frac = rest[len + 1..]
+                    .find(|c: char| !c.is_ascii_digit())
+                    .unwrap_or(rest.len() - len - 1);
+                let digits = &rest[len + 1..len + 1 + frac];
+                let suffix =
+                    rest[len + 1 + frac..].starts_with(|c: char| c.is_ascii_alphanumeric());
+                if suffix || digits.chars().any(|c| c != '0') {
+                    return Err(format!("`{}`: `#if` takes integers only", &rest[..len + 1]));
+                }
+                out.push(Token::Num(int_literal(&rest[..len])?));
+                rest = &rest[len + 1 + frac..];
+                rest = rest.trim_start();
+                continue;
             }
             out.push(Token::Num(int_literal(&rest[..len])?));
             rest = &rest[len..];

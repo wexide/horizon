@@ -28,6 +28,9 @@ pub struct Origin {
 pub struct Diagnostic {
     pub origin: Origin,
     pub message: String,
+    /// The preprocessor went on as a GL driver does (a stray `#endif` ignored, a test it can't
+    /// evaluate read as false): the stage's text is still the pack's intent.
+    pub recovered: bool,
 }
 
 #[derive(Debug, Default)]
@@ -54,6 +57,9 @@ impl Preprocessed {
         format!("{file}:{}", o.line)
     }
 }
+
+/// The most lines one macro call's arguments may take.
+const MAX_CALL_LINES: usize = 256;
 
 /// Runs the preprocessor on the stage file `path` of `pack` with `macros` defined.
 pub fn preprocess(pack: &Pack, path: &str, macros: &Macros) -> Preprocessed {
@@ -112,6 +118,19 @@ impl Run<'_> {
                 line.push_str(lines[n]);
             }
             n += 1;
+            // A function-like macro's arguments over several lines: the lines are expanded as
+            // one, written on the first; the others stay, empty, so lines still map back.
+            if self.conditionals.active() && !line.trim_start().starts_with('#') {
+                while n < lines.len()
+                    && n - first < MAX_CALL_LINES
+                    && !lines[n].trim_start().starts_with('#')
+                    && self.macros.open_call(&line)
+                {
+                    line.push(' ');
+                    line.push_str(lines[n]);
+                    n += 1;
+                }
+            }
             let origin = Origin {
                 file,
                 line: first as u32 + 1,
@@ -149,7 +168,14 @@ impl Run<'_> {
             return self.diagnose(origin, &format!("unknown directive `#{}`", after.trim()));
         };
         match self.conditionals.apply(word, rest, &self.macros) {
-            Err(e) => return self.diagnose(origin, &e),
+            Err(e) => {
+                self.out.diagnostics.push(Diagnostic {
+                    origin,
+                    message: e,
+                    recovered: true,
+                });
+                return;
+            }
             Ok(true) => return,
             Ok(false) if !self.conditionals.active() => return,
             Ok(false) => {}
@@ -217,6 +243,7 @@ impl Run<'_> {
         self.out.diagnostics.push(Diagnostic {
             origin,
             message: message.to_owned(),
+            recovered: false,
         });
     }
 }
