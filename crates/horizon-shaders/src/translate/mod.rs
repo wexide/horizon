@@ -416,21 +416,46 @@ fn translate(
     }
     fragment_main.push_str("}\n");
 
-    let v_text = format!(
-        "{}{}{vertex_main}",
-        header(&v),
-        v.rewrite(&samplers, &uniforms)
-    );
-    let f_text = format!(
-        "{}{}{fragment_main}",
-        header(&f),
-        f.rewrite(&samplers, &uniforms)
-    );
     if !errors.is_empty() {
         return Err(errors);
     }
-    let vertex_module = compile(&v, &v_text, header(&v).lines().count());
-    let fragment_module = compile(&f, &f_text, header(&f).lines().count());
+    // A stage naga refuses for `vector % scalar`, or for `min`/`max` of mixed scalar types, is
+    // written again with calls of ours (`hz_rem`, `hz_min`); only then, so that a stage that
+    // already compiles keeps its own operators and built-ins.
+    let build = |stage: &Stage, main: &str| {
+        let h = header(stage);
+        let (mut remainders, mut mixed) = (false, false);
+        loop {
+            let mut extra = String::new();
+            if remainders {
+                extra.push_str(&rewrite::remainder_functions());
+            }
+            if mixed {
+                extra.push_str(&rewrite::mixed_functions());
+            }
+            let text = format!(
+                "{h}{extra}{}{main}",
+                stage.rewrite(&samplers, &uniforms, remainders, mixed)
+            );
+            let module = compile(stage, &text, h.lines().count() + extra.lines().count());
+            let Err(errors) = &module else {
+                return module;
+            };
+            let says = |s: &str| errors.iter().any(|e| e.message.contains(s));
+            if !remainders && says("Operation Modulo can't work with") {
+                remainders = true;
+            } else if !mixed
+                && (says("Ambiguous best function for 'min'")
+                    || says("Ambiguous best function for 'max'"))
+            {
+                mixed = true;
+            } else {
+                return module;
+            }
+        }
+    };
+    let vertex_module = build(&v, &vertex_main);
+    let fragment_module = build(&f, &fragment_main);
     let (vertex, fragment) = match (vertex_module, fragment_module) {
         (Ok(v), Ok(f)) => (v, f),
         (a, b) => return Err(a.err().into_iter().chain(b.err()).flatten().collect()),
@@ -935,6 +960,92 @@ mod tests {
             (errors[0].file.as_str(), errors[0].line),
             ("lib/bad.glsl", 3),
             "{errors:?}"
+        );
+    }
+
+    fn translates(fsh: &str) {
+        let p = program(
+            &[("composite.vsh", VSH_120), ("composite.fsh", fsh)],
+            Target::Window,
+        );
+        assert!(p.is_ok(), "{:?}", p.err());
+    }
+
+    #[test]
+    fn constants_naga_cannot_evaluate_run_in_main() {
+        // Bliss: `mix` in a constant; IterationT: `transpose`; and a constant built on one.
+        translates(
+            "#version 120\nconst vec3 c = mix(vec3(1.0, 0.0, 0.0), vec3(0.7, 0.3, 0.6), 0.5);\n\
+             const mat3 r = mat3(1.0);\nconst mat3 ri = transpose(r);\nconst vec3 d = c * 2.0;\n\
+             void main() { gl_FragColor = vec4(ri * d, 1.0); }\n",
+        );
+    }
+
+    #[test]
+    fn integer_vectors_take_a_scalar_remainder() {
+        // IterationT's blue noise: `ivec2(gl_FragCoord.xy) % 64`.
+        translates(
+            "#version 330 compatibility\nuniform sampler2D noisetex;\nuniform int frameCounter;\n\
+             vec2 n() { return texelFetch(noisetex, ivec2(gl_FragCoord.xy) % 64, 0).xy + vec2(frameCounter % 64 * 2 % 7); }\n\
+             void main() { ivec3 v = ivec3(5) % 2; gl_FragData[0] = vec4(n(), vec2(v.xy)); }\n",
+        );
+    }
+
+    #[test]
+    fn mixed_min_and_max_convert() {
+        // Derivative's End fog: `min(uint, int)`.
+        translates(
+            "#version 330 compatibility\nuniform float viewWidth;\n\
+             void main() { uint s = uint(viewWidth); s = min(s, 8); s = max(4, s); gl_FragData[0] = vec4(float(s)); }\n",
+        );
+    }
+
+    #[test]
+    fn multi_line_macro_calls_expand() {
+        // IterationT's `saturate(a\n + b)`.
+        translates(
+            "#version 120\n#define saturate(x) clamp(x, 0.0, 1.0)\nuniform float rainStrength;\n\
+             void main() {\n    float a = saturate(rainStrength\n        + 0.5\n        + 0.25);\n    gl_FragColor = vec4(a);\n}\n",
+        );
+    }
+
+    #[test]
+    fn glsl_conversions_naga_lacks() {
+        // Derivative: `in const` parameters, `return 10;` in a `float` function, a function
+        // whose last return is in a block, a swizzled shadow sample, `vec3[2] x = ...`.
+        translates(
+            "#version 330 compatibility\nuniform sampler2DShadow shadowtex1;\nuniform float viewWidth;\n\
+             vec3[2] colors = vec3[2](vec3(1.0), vec3(viewWidth));\n\
+             vec3 grade(in const float s) { return vec3(s); }\nfloat range(int i) { if (i == 1) return 10 * 0.5; return 10; }\n\
+             vec4 last(float d) { { if (d > 1.0) return vec4(0.0); return vec4(d); } }\n\
+             void main() { float s = textureLod(shadowtex1, vec3(0.5), 0).x;\n\
+             gl_FragData[0] = vec4(grade(s) + colors[1], range(1)) + last(viewWidth); }\n",
+        );
+    }
+
+    #[test]
+    fn old_names_and_vertex_sampling() {
+        // Bliss: `texelFetch2D`, a parameter named `sampler`, `texture2D` in a vertex stage;
+        // IterationT: a local named as the sampler it is initialized from.
+        let vsh = "#version 120\nuniform sampler2D colortex6;\nvarying vec3 c;\n\
+                   void main() { gl_Position = ftransform(); c = texture2D(colortex6, vec2(0.5)).rgb; }\n";
+        let fsh = "#version 120\nuniform sampler2D tex;\nuniform sampler2D colortex6;\nvarying vec3 c;\n\
+                   vec3 sky(vec3 p, sampler2D sampler) { return texture2D(sampler, p.xy).rgb; }\n\
+                   void main() { vec4 tex = texture2D(tex, vec2(0.5));\n\
+                   gl_FragColor = vec4(sky(c, colortex6), 1.0) + texelFetch2D(colortex6, ivec2(0), 0) + tex; }\n";
+        let p = program(
+            &[("composite.vsh", vsh), ("composite.fsh", fsh)],
+            Target::Window,
+        );
+        assert!(p.is_ok(), "{:?}", p.err());
+    }
+
+    #[test]
+    fn texture_gather_reads_four_texels() {
+        // Derivative's depth max: `textureGather(depthtex0, uv)`.
+        translates(
+            "#version 330 compatibility\nuniform sampler2D depthtex0;\n\
+             void main() { vec4 d = textureGather(depthtex0, vec2(0.5)); gl_FragData[0] = d + textureGather(depthtex0, vec2(0.25), 1); }\n",
         );
     }
 }

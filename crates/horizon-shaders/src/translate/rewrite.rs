@@ -34,6 +34,20 @@ impl Stage<'_> {
                  const mat4 hz_TextureMatrix[8] = mat4[8](mat4(1.0), mat4(1.0), mat4(1.0), mat4(1.0), mat4(1.0), mat4(1.0), mat4(1.0), mat4(1.0));\n",
             );
         }
+        if self.tokens.contains(&"textureGather") {
+            // naga's GLSL frontend has no `textureGather`: the four texels a bilinear sample of
+            // `uv` reads, in the order the built-in returns them, component `c` of each.
+            p.push_str(
+                "vec4 hz_textureGather(texture2D t, sampler s, vec2 uv, int c) { \
+                 ivec2 m = textureSize(sampler2D(t, s), 0) - 1; \
+                 ivec2 b = ivec2(floor(uv * vec2(m + 1) - 0.5)); \
+                 return vec4(texelFetch(sampler2D(t, s), clamp(b + ivec2(0, 1), ivec2(0), m), 0)[c], \
+                 texelFetch(sampler2D(t, s), clamp(b + ivec2(1, 1), ivec2(0), m), 0)[c], \
+                 texelFetch(sampler2D(t, s), clamp(b + ivec2(1, 0), ivec2(0), m), 0)[c], \
+                 texelFetch(sampler2D(t, s), clamp(b, ivec2(0), m), 0)[c]); } \
+                 vec4 hz_textureGather(texture2D t, sampler s, vec2 uv) { return hz_textureGather(t, s, uv, 0); }\n",
+            );
+        }
         if self.kind == ShaderStage::Vertex {
             p.push_str(
                 "const vec2 hz_quad[6] = vec2[6](vec2(0.0, 0.0), vec2(1.0, 0.0), vec2(1.0, 1.0), vec2(0.0, 0.0), vec2(1.0, 1.0), vec2(0.0, 1.0));\n\
@@ -60,7 +74,14 @@ impl Stage<'_> {
         &self,
         samplers: &[Sampler],
         uniforms: &BTreeMap<String, String>,
+        remainders: bool,
+        mixed: bool,
     ) -> String {
+        let rem = if remainders {
+            self.remainder_calls()
+        } else {
+            Remainders::default()
+        };
         let removed = |i: usize| self.removed.iter().any(|r| r.contains(&i));
         let sampler_ty: HashMap<&str, &str> = samplers
             .iter()
@@ -75,12 +96,44 @@ impl Stage<'_> {
         let mut params: HashMap<String, String> = HashMap::new();
         // Names of samplers a local variable or parameter of the function hides.
         let mut hidden: Vec<&str> = Vec::new();
+        // `vec4 tex = texture(tex, uv);`: the variable hides the sampler from the end of its
+        // initializer on (GLSL's scope rule): the token there, and the name.
+        let mut hide_at: Vec<(usize, &str)> = Vec::new();
+        // The function being written: its return type when GLSL converts what it returns
+        // (`return 10;` in a `float` function), and whether its last statement so far returns.
+        let mut fn_type: Option<&str> = None;
+        let (mut statement_start, mut last_returns) = (false, false);
+        // Text to write before a token: the `)` of `return float(...)`.
+        let mut close_before: HashMap<usize, usize> = HashMap::new();
+        // Calls on a shadow sampler whose result is swizzled: `vec4(textureLod(s, p, 0)).x`.
+        let mut swizzled: std::collections::HashSet<usize> = std::collections::HashSet::new();
         let mut depth = 0;
         let mut skip_until = 0;
         let next = |i: usize| (i + 1..self.tokens.len()).find(|&j| significant(self.tokens[j]));
         let prev = |i: usize| (0..i).rev().find(|&j| significant(self.tokens[j]));
         for (i, &t) in self.tokens.iter().enumerate() {
+            hide_at.retain(|&(at, name)| {
+                if at == i {
+                    hidden.push(name);
+                }
+                at != i
+            });
+            if let Some(n) = close_before.remove(&i) {
+                out.push_str(&")".repeat(n));
+            }
+            if depth == 1 && significant(t) && statement_start {
+                last_returns = t == "return";
+                statement_start = false;
+            }
+            if let Some(&(close, open)) = rem.before.get(&i) {
+                out.push_str(&")".repeat(close));
+                out.push_str(&"hz_rem(".repeat(open));
+            }
             if i < skip_until {
+                continue;
+            }
+            if rem.percent.contains(&i) {
+                out.push(',');
                 continue;
             }
             if let Some(text) = self.replaced.get(&i) {
@@ -96,20 +149,44 @@ impl Stage<'_> {
             }
             let called = next(i).is_some_and(|j| self.tokens[j] == "(");
             match t {
-                "{" => depth += 1,
+                "{" => {
+                    if depth == 0 {
+                        fn_type = prev(i)
+                            .filter(|&j| self.tokens[j] == ")")
+                            .and_then(|j| self.function_type(j));
+                    }
+                    depth += 1;
+                    statement_start = depth == 1;
+                }
                 "}" => {
+                    if depth == 1
+                        && let Some(ty) = fn_type
+                        && !last_returns
+                    {
+                        // GLSL lets a function end without returning; naga does not.
+                        write!(out, "return {ty}(0); ").unwrap();
+                    }
                     depth -= 1;
                     if depth == 0 {
                         params.clear();
                         hidden.clear();
+                        fn_type = None;
                     }
+                    statement_start = depth == 1;
+                    last_returns = false;
                 }
+                ";" => statement_start = depth == 1,
                 "(" => {
                     let callee = prev(i).map_or("", |j| self.tokens[j]);
-                    let close = if matches!(callee, "shadow2D" | "shadow2DLod" | "shadow2DProj") {
-                        ")"
-                    } else {
-                        ""
+                    let vertex_sample = !fragment && IMPLICIT_LOD.contains(&callee);
+                    let close = match callee {
+                        _ if swizzled.contains(&i) && vertex_sample => ", 0.0)",
+                        _ if swizzled.contains(&i) => ")",
+                        "shadow2D" if vertex_sample => ", 0.0)",
+                        "shadow2D" | "shadow2DLod" | "shadow2DProj" => ")",
+                        // A vertex stage has no derivatives: GLSL samples its level 0.
+                        _ if vertex_sample => ", 0.0",
+                        _ => "",
                     };
                     calls.push((callee, close, 0));
                 }
@@ -144,7 +221,8 @@ impl Stage<'_> {
                 if let Some(n) = next(i).filter(|&n| is_ident(self.tokens[n])) {
                     let name = self.tokens[n];
                     let (texture, sampler) = split_sampler(t);
-                    write!(out, "{texture} {name}, {sampler} hz_s_{name}").unwrap();
+                    let renamed = keyword_name(name);
+                    write!(out, "{texture} {renamed}, {sampler} hz_s_{renamed}").unwrap();
                     params.insert(name.to_owned(), t.to_owned());
                     skip_until = n + 1;
                     continue;
@@ -159,7 +237,14 @@ impl Stage<'_> {
                     continue;
                 }
                 if before.is_some_and(|b| is_ident(b) && !matches!(b, "return" | "case" | "else")) {
-                    hidden.push(t);
+                    match next(i).filter(|&j| self.tokens[j] == "=") {
+                        Some(eq) => {
+                            hide_at.push((self.initializer_end(eq), t));
+                            out.push_str(t);
+                            continue;
+                        }
+                        None => hidden.push(t),
+                    }
                 }
             }
             if hidden.contains(&t) {
@@ -172,11 +257,14 @@ impl Stage<'_> {
                 .or_else(|| sampler_ty.get(t).copied());
             if let Some(ty) = sampler {
                 let as_argument = calls.last().is_some_and(|(callee, _, arg)| {
-                    self.sampler_functions
-                        .get(*callee)
-                        .is_some_and(|p| p.get(*arg) == Some(&true))
+                    (*callee == "textureGather" && *arg == 0)
+                        || self
+                            .sampler_functions
+                            .get(*callee)
+                            .is_some_and(|p| p.get(*arg) == Some(&true))
                 }) && prev(i)
                     .is_some_and(|j| matches!(self.tokens[j], "(" | ","));
+                let t = keyword_name(t);
                 if as_argument {
                     write!(out, "{t}, hz_s_{t}").unwrap();
                 } else {
@@ -188,8 +276,37 @@ impl Stage<'_> {
                 write!(out, "(hz_bool_{t} != 0)").unwrap();
                 continue;
             }
+            // `textureLod(shadowtex, p, 0).x`: GLSL swizzles the scalar a shadow sampler gives.
+            if called
+                && t.starts_with("texture")
+                && let Some(open) = next(i)
+                && let Some(first) = next(open)
+                && params
+                    .get(self.tokens[first])
+                    .map(String::as_str)
+                    .or_else(|| sampler_ty.get(self.tokens[first]).copied())
+                    .is_some_and(|ty| ty.contains("Shadow"))
+                && let Some(close) = self.matching(open)
+                && next(close).is_some_and(|j| self.tokens[j] == ".")
+            {
+                swizzled.insert(open);
+                out.push_str("vec4(");
+            }
             let replaced: Option<String> = match t {
                 "main" if depth == 0 && called => Some("hz_main".into()),
+                "textureGather" if called => Some("hz_textureGather".into()),
+                "min" | "max" if called && mixed => Some(format!("hz_{t}")),
+                // `return 10;` in a `float` function: GLSL converts, naga does not.
+                "return"
+                    if depth > 0
+                        && fn_type.is_some()
+                        && next(i).is_some_and(|j| self.tokens[j] != ";") =>
+                {
+                    *close_before.entry(self.initializer_end(i)).or_default() += 1;
+                    Some(format!("return {}(", fn_type.unwrap_or_default()))
+                }
+                // `in const float x`: a parameter qualifier GLSL takes and naga's frontend does not.
+                "const" if depth == 0 && !calls.is_empty() => Some(String::new()),
                 // naga's frontend leaves the code after an unconditional `discard` or `return;`
                 // unreachable but half-built (a module that fails validation): behind an `if`
                 // it stays reachable as far as naga knows.
@@ -199,6 +316,10 @@ impl Stage<'_> {
                 }
                 // GLSL's `modf`, which naga's frontend lacks.
                 "modf" if called => Some("hz_modf".into()),
+                _ if !fragment && called && IMPLICIT_LOD.contains(&t) => Some(match t {
+                    "shadow2D" => "vec4(textureLod".into(),
+                    _ => "textureLod".into(),
+                }),
                 "texture2D" | "texture1D" | "texture3D" | "textureCube" if called => {
                     Some("texture".into())
                 }
@@ -208,6 +329,9 @@ impl Stage<'_> {
                     Some("textureLod".into())
                 }
                 "texture2DProj" if called => Some("textureProj".into()),
+                "texelFetch2D" | "texelFetch3D" | "texelFetch1D" if called => {
+                    Some("texelFetch".into())
+                }
                 "texture2DGrad" | "texture2DGradARB" if called => Some("textureGrad".into()),
                 "shadow2D" if called => Some("vec4(texture".into()),
                 "shadow2DLod" if called => Some("vec4(textureLod".into()),
@@ -234,15 +358,17 @@ impl Stage<'_> {
                 "gl_FragCoord" => Some("hz_FragCoord".into()),
                 "gl_FrontColor" => Some("hz_FrontColor".into()),
                 "gl_Fog" => Some("hz_Fog".into()),
+                "gl_VertexID" => Some("gl_VertexIndex".into()),
+                "gl_InstanceID" => Some("gl_InstanceIndex".into()),
                 _ if UNIFORM_STATE.iter().any(|b| t.starts_with(b)) => {
                     Some(format!("hz_{}", &t[3..]))
                 }
                 _ if !fragment && VERTEX_INPUTS.iter().any(|b| t.starts_with(b)) => {
                     Some(format!("hz_{}", &t[3..]))
                 }
-                "gl_VertexID" => Some("gl_VertexIndex".into()),
-                "gl_InstanceID" => Some("gl_InstanceIndex".into()),
                 _ if old && LATER_KEYWORDS.contains(&t) => Some(format!("hz_kw_{t}")),
+                // OpenGL's GLSL has no `sampler` type; Vulkan's, which naga reads, does.
+                "sampler" => Some("hz_kw_sampler".into()),
                 _ => None,
             };
             out.push_str(replaced.as_deref().unwrap_or(t));
@@ -251,7 +377,271 @@ impl Stage<'_> {
     }
 }
 
+/// Where `a % b` becomes `hz_rem(a, b)`: per token, the `)` to close and the `hz_rem(` to open
+/// before it, and the `%` tokens written as `,`.
+#[derive(Default)]
+pub(super) struct Remainders {
+    before: HashMap<usize, (usize, usize)>,
+    percent: std::collections::HashSet<usize>,
+}
+
+/// `hz_rem` for every pair of operands GLSL's `%` takes: naga's frontend widens a scalar beside a
+/// vector for `+`, `-`, `/` and the bitwise operators, but not for `%` (`ivec2(p) % 64`).
+pub(super) fn remainder_functions() -> String {
+    let mut s = String::new();
+    for (scalar, vector) in [("int", "ivec"), ("uint", "uvec"), ("float", "vec")] {
+        write!(
+            s,
+            "{scalar} hz_rem({scalar} a, {scalar} b) {{ return a % b; }} "
+        )
+        .unwrap();
+        for n in 2..=4 {
+            let v = format!("{vector}{n}");
+            write!(
+                s,
+                "{v} hz_rem({v} a, {v} b) {{ return a % b; }} \
+                 {v} hz_rem({v} a, {scalar} b) {{ return a % {v}(b); }} \
+                 {v} hz_rem({scalar} a, {v} b) {{ return {v}(a) % b; }} "
+            )
+            .unwrap();
+        }
+    }
+    s.push('\n');
+    s
+}
+
+/// Sampling calls that pick their level from derivatives: in a vertex stage, `textureLod` of 0.
+const IMPLICIT_LOD: [&str; 6] = [
+    "texture",
+    "texture1D",
+    "texture2D",
+    "texture3D",
+    "textureCube",
+    "shadow2D",
+];
+
+/// A name that is a keyword in the GLSL naga reads, written as ours.
+fn keyword_name(name: &str) -> std::borrow::Cow<'_, str> {
+    match name {
+        "sampler" => "hz_kw_sampler".into(),
+        _ => name.into(),
+    }
+}
+
+/// `hz_min` and `hz_max` for operands of different scalar types: GLSL converts `min(u, 4)` to
+/// `uint`, where naga's frontend finds two built-ins as good and refuses.
+pub(super) fn mixed_functions() -> String {
+    let mut s = String::new();
+    let pairs = [
+        ("int", "int", "int"),
+        ("uint", "uint", "uint"),
+        ("float", "float", "float"),
+        ("uint", "int", "uint"),
+        ("int", "uint", "uint"),
+        ("float", "int", "float"),
+        ("int", "float", "float"),
+        ("float", "uint", "float"),
+        ("uint", "float", "float"),
+    ];
+    for f in ["min", "max"] {
+        for (a, b, r) in pairs {
+            write!(
+                s,
+                "{r} hz_{f}({a} a, {b} b) {{ return {f}({r}(a), {r}(b)); }} "
+            )
+            .unwrap();
+        }
+        for (scalar, vector) in [("int", "ivec"), ("uint", "uvec"), ("float", "vec")] {
+            for n in 2..=4 {
+                let v = format!("{vector}{n}");
+                write!(
+                    s,
+                    "{v} hz_{f}({v} a, {v} b) {{ return {f}(a, b); }} \
+                     {v} hz_{f}({v} a, {scalar} b) {{ return {f}(a, {v}(b)); }} "
+                )
+                .unwrap();
+            }
+        }
+    }
+    s.push('\n');
+    s
+}
+
+/// Words that take a parenthesis without being called.
+const NOT_CALLS: [&str; 8] = [
+    "if", "while", "for", "switch", "return", "else", "case", "do",
+];
+
 impl Stage<'_> {
+    /// Every `a % b` in a function's body, as `hz_rem(a, b)`: the left operand is the run of
+    /// multiplicative terms before the `%` (`%` binds as `*` and `/`, left to right), the right
+    /// one the unary expression after it. A `%` whose operands are not plain is left as it is.
+    pub(super) fn remainder_calls(&self) -> Remainders {
+        let sig: Vec<usize> = (0..self.tokens.len())
+            .filter(|&i| significant(self.tokens[i]))
+            .collect();
+        let tok = |k: usize| self.tokens[sig[k]];
+        let n = sig.len();
+        let mut partner = vec![usize::MAX; n];
+        let mut stack = Vec::new();
+        for k in 0..n {
+            match tok(k) {
+                "(" | "[" | "{" => stack.push(k),
+                ")" | "]" | "}" => {
+                    if let Some(o) = stack.pop() {
+                        partner[o] = k;
+                        partner[k] = o;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let number = |t: &str| t.starts_with(|c: char| c.is_ascii_digit() || c == '.') && t != ".";
+        let call = |k: usize| k > 0 && is_ident(tok(k - 1)) && !NOT_CALLS.contains(&tok(k - 1));
+        // The first token of the postfix expression ending at `k`.
+        let term_start = |mut k: usize| -> Option<usize> {
+            loop {
+                match tok(k) {
+                    ")" => {
+                        let o = *partner.get(k).filter(|&&o| o != usize::MAX)?;
+                        k = if call(o) { o - 1 } else { o };
+                    }
+                    "]" => {
+                        let o = *partner.get(k).filter(|&&o| o != usize::MAX)?;
+                        k = o.checked_sub(1)?;
+                        continue;
+                    }
+                    t if (is_ident(t) && !NOT_CALLS.contains(&t)) || number(t) => {}
+                    _ => return None,
+                }
+                if k >= 2 && tok(k - 1) == "." {
+                    k -= 2;
+                    continue;
+                }
+                return Some(k);
+            }
+        };
+        // The last token of the unary expression starting at `k`.
+        let term_end = |mut k: usize| -> Option<usize> {
+            while k < n && matches!(tok(k), "-" | "+" | "!" | "~") {
+                k += 1;
+            }
+            let t = *self.tokens.get(*sig.get(k)?)?;
+            if t == "(" {
+                k = *partner.get(k).filter(|&&o| o != usize::MAX)?;
+            } else if is_ident(t) && !NOT_CALLS.contains(&t) {
+                if k + 1 < n && tok(k + 1) == "(" {
+                    k = *partner.get(k + 1).filter(|&&o| o != usize::MAX)?;
+                }
+            } else if !number(t) {
+                return None;
+            }
+            loop {
+                if k + 1 < n && tok(k + 1) == "[" {
+                    k = *partner.get(k + 1).filter(|&&o| o != usize::MAX)?;
+                } else if k + 2 < n && tok(k + 1) == "." && is_ident(tok(k + 2)) {
+                    k += 2;
+                    if k + 1 < n && tok(k + 1) == "(" {
+                        k = *partner.get(k + 1).filter(|&&o| o != usize::MAX)?;
+                    }
+                } else {
+                    return Some(k);
+                }
+            }
+        };
+        let mut r = Remainders::default();
+        let mut depth = 0;
+        for k in 0..n {
+            match tok(k) {
+                "{" => depth += 1,
+                "}" => depth -= 1,
+                "%" if depth > 0 && k > 0 && k + 1 < n && tok(k + 1) != "=" => {
+                    // The left operand: terms joined by `*`, `/` and `%`.
+                    let Some(mut start) = term_start(k - 1) else {
+                        continue;
+                    };
+                    while start >= 2 && matches!(tok(start - 1), "*" | "/" | "%") {
+                        match term_start(start - 2) {
+                            Some(s) => start = s,
+                            None => break,
+                        }
+                    }
+                    let Some(end) = term_end(k + 1) else {
+                        continue;
+                    };
+                    r.before.entry(sig[start]).or_default().1 += 1;
+                    r.before.entry(sig[end] + 1).or_default().0 += 1;
+                    r.percent.insert(sig[k]);
+                }
+                _ => {}
+            }
+        }
+        r
+    }
+
+    /// The `)` that closes the bracket at `open`.
+    pub(super) fn matching(&self, open: usize) -> Option<usize> {
+        let mut nesting = 0;
+        for (j, &t) in self.tokens.iter().enumerate().skip(open) {
+            match t {
+                "(" | "[" | "{" => nesting += 1,
+                ")" | "]" | "}" => {
+                    nesting -= 1;
+                    if nesting == 0 {
+                        return Some(j);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// The return type of the function whose parameter list ends at `close`, when it is one
+    /// GLSL converts to (a scalar, vector or matrix); `None` for `void`, structs and arrays.
+    pub(super) fn function_type(&self, close: usize) -> Option<&str> {
+        let mut nesting = 0;
+        let mut open = None;
+        for j in (0..=close).rev() {
+            match self.tokens[j] {
+                ")" => nesting += 1,
+                "(" => {
+                    nesting -= 1;
+                    if nesting == 0 {
+                        open = Some(j);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let significant_before = |i: usize| (0..i).rev().find(|&j| significant(self.tokens[j]));
+        let name = significant_before(open?)?;
+        if !is_ident(self.tokens[name]) || NOT_CALLS.contains(&self.tokens[name]) {
+            return None;
+        }
+        let ty = self.tokens[significant_before(name)?];
+        let base = ty.trim_start_matches(['i', 'u', 'b', 'd']);
+        let convertible = matches!(ty, "float" | "int" | "uint" | "bool" | "double")
+            || base.starts_with("vec")
+            || ty.starts_with("mat");
+        convertible.then_some(ty)
+    }
+
+    /// The `,` or `;` that ends the initializer whose `=` is at `eq`.
+    pub(super) fn initializer_end(&self, eq: usize) -> usize {
+        let mut nesting = 0;
+        for (j, &t) in self.tokens.iter().enumerate().skip(eq + 1) {
+            match t {
+                "(" | "[" | "{" => nesting += 1,
+                ")" | "]" | "}" => nesting -= 1,
+                "," | ";" if nesting <= 0 => return j,
+                _ => {}
+            }
+        }
+        self.tokens.len()
+    }
+
     /// The element count of an unsized array whose `[]` ends at `close`: the arguments of the
     /// constructor that follows (`[] = T[](...)` or `[](...)`).
     pub(super) fn array_length(&self, close: usize) -> Option<usize> {

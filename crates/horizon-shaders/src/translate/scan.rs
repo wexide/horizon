@@ -60,6 +60,34 @@ pub(super) const QUALIFIERS: [&str; 11] = [
     "sample",
     "const",
 ];
+/// GLSL built-ins naga's constant evaluator does not evaluate: a global `const` calling one
+/// is initialized in our `main` instead.
+pub(super) const NOT_CONSTANT: [&str; 24] = [
+    "mix",
+    "smoothstep",
+    "transpose",
+    "inverse",
+    "determinant",
+    "outerProduct",
+    "reflect",
+    "refract",
+    "faceforward",
+    "modf",
+    "frexp",
+    "ldexp",
+    "bitfieldExtract",
+    "bitfieldInsert",
+    "packUnorm4x8",
+    "packSnorm4x8",
+    "packUnorm2x16",
+    "packSnorm2x16",
+    "packHalf2x16",
+    "unpackUnorm4x8",
+    "unpackSnorm4x8",
+    "unpackUnorm2x16",
+    "unpackSnorm2x16",
+    "unpackHalf2x16",
+];
 /// The compatibility profile's uniform state (with its `Inverse`/`Transpose` forms).
 pub(super) const UNIFORM_STATE: [&str; 5] = [
     "gl_ModelViewMatrix",
@@ -366,9 +394,19 @@ impl<'p> Stage<'p> {
         }
         declarators.push((begin, assign, words.len()));
         let constant = words[..eq].iter().any(|&i| text(i) == "const");
-        let conditional =
-            |d: &(usize, Option<usize>, usize)| words[d.0..d.2].iter().any(|&i| text(i) == "?");
-        if constant && !declarators.iter().any(conditional) {
+        // What naga cannot evaluate at global scope: a conditional, a built-in its constant
+        // evaluator lacks (`const vec3 c = mix(a, b, 0.5);`), or a global already moved to our
+        // `main`.
+        let runtime = |d: &(usize, Option<usize>, usize)| {
+            words[d.0..d.2].iter().enumerate().any(|(n, &i)| {
+                let t = text(i);
+                let called = words.get(d.0 + n + 1).is_some_and(|&j| text(j) == "(");
+                t == "?"
+                    || (called && NOT_CONSTANT.contains(&t))
+                    || self.inits.iter().any(|g| g == t)
+            })
+        };
+        if constant && !declarators.iter().any(runtime) {
             return;
         }
         // The first declarator's name ends the type.
@@ -385,7 +423,8 @@ impl<'p> Stage<'p> {
                     Some(n) => write!(ty, "{n}]").unwrap(),
                     None => return,
                 },
-                t if ty.is_empty() || t == "[" => ty.push_str(t),
+                // `vec3[50] colors = ...`: the size and `]` belong to the type.
+                t if ty.is_empty() || t == "[" || t == "]" || ty.ends_with('[') => ty.push_str(t),
                 // Qualifiers before the type (`highp`...): the type is the last word.
                 t => ty = t.to_owned(),
             }
