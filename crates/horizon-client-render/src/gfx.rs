@@ -2680,15 +2680,18 @@ impl Renderer {
             mapped_at_creation: false,
         });
         let flat_wanted = flat::wanted(&adapter, &device);
+        // Flat draws where the device has them: the game's terrain uses them where wanted, a
+        // shader pack's terrain wherever they exist (it reads face normals and block ids there).
+        let flat_available = flat::available(&adapter, &device);
         // Readable as storage where flat draws run: a shader pack's terrain program reads them.
         let arena = arena::Arena::new(
             &device,
             std::mem::size_of::<TerrainVertex>() as u64,
             1 << 20,
-            flat_wanted,
+            flat_available,
         );
         // Sections as one index list per frame where multi-draw is emulated.
-        let flat = flat_wanted.then(|| {
+        let flat = flat_available.then(|| {
             let buffers = [Some(wgpu::VertexBufferLayout {
                 array_stride: std::mem::size_of::<TerrainVertex>() as u64,
                 step_mode: wgpu::VertexStepMode::Vertex,
@@ -2812,7 +2815,7 @@ impl Renderer {
             config,
             solid,
             translucent,
-            flat_on: flat.is_some(),
+            flat_on: flat.is_some() && flat_wanted,
             cull_on: cull.is_some(),
             sides_on: true,
             cull,
@@ -3800,8 +3803,9 @@ impl Renderer {
             );
             self.queue.submit([encoder.finish()]);
         }
-        // Flat draws whenever the device has them (`render` keeps them on with a pack).
-        self.pack_terrain_flat = self.flat.is_some() && self.flat_on;
+        // Flat draws whenever the device has them (`render` draws flat with a pack, whatever
+        // the game's own terrain does): the pack's vertices get face normals and block ids.
+        self.pack_terrain_flat = self.flat.is_some();
         Some(
             self.pack_atlas
                 .as_ref()?
@@ -4975,9 +4979,8 @@ impl Renderer {
         }
         let flat_frame = match &mut self.flat {
             Some(flat)
-                if self.flat_on
-                    && !self.draws.is_empty()
-                    && (self.drawn_sections >= flat.min_sections
+                if !self.draws.is_empty()
+                    && ((self.flat_on && self.drawn_sections >= flat.min_sections)
                         || pack_terrain
                         || shadow_view.is_some()) =>
             {

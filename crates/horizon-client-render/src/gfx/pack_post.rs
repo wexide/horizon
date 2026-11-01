@@ -2905,7 +2905,11 @@ mod tests {
         assert_eq!(half_bits(1.0e6), 0x7c00);
         assert_eq!(half_bits(2f32.powi(-24)), 0x0001);
         assert_eq!(half_bits(1.0 + 2f32.powi(-11)), 0x3c00, "ties go to even");
-        assert_eq!(half_bits(1.0 + 3.0 * 2f32.powi(-11)), 0x3c02, "ties go to even");
+        assert_eq!(
+            half_bits(1.0 + 3.0 * 2f32.powi(-11)),
+            0x3c02,
+            "ties go to even"
+        );
         let texel = expand_rgba16f(&[0, 0, 128, 63, 0, 0, 0, 64], 2, 1);
         assert_eq!(texel, [0x00, 0x3c, 0x00, 0x40, 0x00, 0x00, 0x00, 0x3c]);
     }

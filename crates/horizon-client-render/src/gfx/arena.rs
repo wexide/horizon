@@ -7,6 +7,9 @@ use std::collections::BTreeMap;
 pub const GRAIN: u64 = 256;
 /// The largest page, in bytes.
 pub const PAGE_BYTES: u64 = 256 << 20;
+/// The smallest page a storage-readable arena takes: its pages are bound whole as storage, so
+/// they are no larger than the device's storage bindings, nor smaller than this.
+pub const MIN_STORAGE_PAGE_BYTES: u64 = 64 << 20;
 
 /// Free vertex ranges: start -> length, never adjacent.
 #[derive(Debug, PartialEq)]
@@ -119,8 +122,13 @@ impl Arena {
         capacity: u64,
         usage: wgpu::BufferUsages,
     ) -> Self {
-        // 256 MiB pages, or less where the device's buffers are smaller.
-        let bytes = device.limits().max_buffer_size.min(PAGE_BYTES);
+        // 256 MiB pages, or less where the device's buffers, or its storage bindings when the
+        // pages are read as storage, are smaller.
+        let limits = device.limits();
+        let mut bytes = limits.max_buffer_size.min(PAGE_BYTES);
+        if usage.contains(wgpu::BufferUsages::STORAGE) {
+            bytes = bytes.min(limits.max_storage_buffer_binding_size);
+        }
         let page_limit = (bytes / stride) / GRAIN * GRAIN;
         let capacity = capacity.next_multiple_of(GRAIN).min(page_limit);
         Self {

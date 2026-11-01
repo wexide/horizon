@@ -120,6 +120,13 @@ pub const MIN_SECTIONS: usize = 1600;
 /// Whether flat draws apply: the backend emulates multi-draw, and vertex
 /// shaders can read storage buffers large enough for an index page.
 /// `HORIZON_FLAT_DRAWS=1` draws every frame flat, `0` none.
+/// Whether the device can draw flat at all: then a shader pack's terrain draws flat whether or
+/// not the game's own terrain does (`wanted`), for the vertex's face normal and block id, which
+/// it reads from the arena (pack_atlas.rs). `HORIZON_FLAT_DRAWS=0` turns it off everywhere.
+pub fn available(adapter: &wgpu::Adapter, device: &wgpu::Device) -> bool {
+    std::env::var("HORIZON_FLAT_DRAWS").as_deref() != Ok("0") && supported(adapter, device)
+}
+
 pub fn wanted(adapter: &wgpu::Adapter, device: &wgpu::Device) -> bool {
     match std::env::var("HORIZON_FLAT_DRAWS").as_deref() {
         Ok("0") => return false,
@@ -147,7 +154,7 @@ fn supported(adapter: &wgpu::Adapter, device: &wgpu::Device) -> bool {
     let limits = device.limits();
     flags.contains(wgpu::DownlevelFlags::VERTEX_STORAGE | wgpu::DownlevelFlags::COMPUTE_SHADERS)
         && limits.max_storage_buffers_per_shader_stage >= 3
-        && limits.max_storage_buffer_binding_size >= super::arena::PAGE_BYTES
+        && limits.max_storage_buffer_binding_size >= super::arena::MIN_STORAGE_PAGE_BYTES
 }
 
 fn storage(binding: u32, stage: wgpu::ShaderStages, read_only: bool) -> wgpu::BindGroupLayoutEntry {
