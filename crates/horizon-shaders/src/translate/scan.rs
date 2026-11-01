@@ -229,6 +229,15 @@ impl<'p> Stage<'p> {
             .flatten()
     }
 
+    /// Whether the code names output 0 (`gl_FragColor`, `gl_FragData[0]`), the one the
+    /// geometry's alpha test reads. Bliss's weather writes only `gl_FragData[1]`.
+    pub(super) fn names_output0(&self) -> bool {
+        self.tokens.iter().enumerate().any(|(i, &t)| {
+            t == "gl_FragColor"
+                || (t == "gl_FragData" && self.index_after(i).is_none_or(|(n, _)| n == 0))
+        })
+    }
+
     pub(super) fn error(&self, token: usize, message: &str) -> Error {
         let line: usize = self.tokens[..token.min(self.tokens.len())]
             .iter()

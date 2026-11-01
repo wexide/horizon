@@ -399,10 +399,12 @@ fn translate(
         writeln!(fragment_main, "    {name} = hz_init_{name}();").unwrap();
     }
     fragment_main.push_str("    hz_main();\n");
-    // With `out` variables the pack tests alpha itself.
+    // With `out` variables the pack tests alpha itself; a program that never writes output 0
+    // leaves it as it was (GL), so testing its alpha would drop the outputs it does write.
     if let Some(t) = gbuffers.and_then(|g| g.alpha_test)
         && f.outputs.contains(&0)
         && !f.frag_outs.iter().any(|(n, _)| *n == 0)
+        && f.names_output0()
     {
         match t.op {
             "false" => fragment_main.push_str("    discard;\n"),
@@ -921,7 +923,10 @@ mod tests {
         let legacy = "#version 120\nvoid main() { gl_FragData[0] = vec4(0.5); }\n";
         let outs =
             "#version 330\nlayout(location = 0) out vec4 c;\nvoid main() { c = vec4(0.5); }\n";
-        for (fsh, kills) in [(legacy, true), (outs, false)] {
+        // Bliss's weather: output 0 is drawn to but never written, output 1 is.
+        let second =
+            "#version 120\n/* DRAWBUFFERS:29 */\nvoid main() { gl_FragData[1] = vec4(0.5); }\n";
+        for (fsh, kills) in [(legacy, true), (outs, false), (second, false)] {
             let files = [
                 ("shaders/gbuffers_entities.vsh", vsh),
                 ("shaders/gbuffers_entities.fsh", fsh),
@@ -944,7 +949,8 @@ mod tests {
             let kill = functions
                 .chain([&p.fragment.entry_points[0].function])
                 .any(|f| format!("{:?}", f.body).contains("Kill"));
-            // With `out` variables the pack tests alpha itself.
+            // With `out` variables the pack tests alpha itself; without a write to output 0
+            // there is nothing to test.
             assert_eq!(kill, kills, "{fsh}");
         }
     }
