@@ -2442,6 +2442,12 @@ impl PackPost {
         self.weather = Some(passes);
     }
 
+    /// Whether the pack runs a shadow pass, which turns off the game's entity shadows (Iris's
+    /// `shouldDisableVanillaEntityShadows`, as OptiFine does).
+    pub fn has_shadow_pass(&self) -> bool {
+        self.shadow_targets.is_some()
+    }
+
     /// Whether the pack draws rain and snow itself.
     pub fn has_weather(&self) -> bool {
         self.weather.is_some()

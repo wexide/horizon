@@ -3844,6 +3844,14 @@ impl Renderer {
     pub fn shader_pack_dimension(&self) -> Option<i32> {
         self.pack_post.as_ref().map(|p| p.0)
     }
+    /// Whether the loaded shader pack casts its own shadows (the game's round entity shadows
+    /// are then left out).
+    pub fn shader_pack_shadows(&self) -> bool {
+        self.pack_post
+            .as_ref()
+            .and_then(|p| p.1.as_ref())
+            .is_some_and(|p| p.has_shadow_pass())
+    }
     /// The Texture Filtering and Max Anisotropy options (`filtering`: 0 none, 1 RGSS, 2
     /// anisotropic; `bit`: `maxAnisotropyBit`). None is the nearest sampler terrain always used;
     /// the others take LevelRenderer's chunk layer sampler (linear, clamped, `bit` anisotropy
