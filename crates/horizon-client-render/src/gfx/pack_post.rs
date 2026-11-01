@@ -661,6 +661,42 @@ fn decode_png(bytes: &[u8]) -> Option<([u32; 2], Vec<u8>)> {
     Some(([info.width, info.height], rgba))
 }
 
+/// What the programs before each one of a stage wrote, in the order they run (Iris's buffers
+/// "flipped at least once"): a stage starts from its `_pre` flips, and `final` goes on from the
+/// composites.
+struct StageWrites {
+    stage: Option<(&'static str, u16)>,
+    deferred_pre: u16,
+    composite_pre: u16,
+}
+
+impl StageWrites {
+    fn new(deferred_pre: u16, composite_pre: u16) -> Self {
+        Self {
+            stage: None,
+            deferred_pre,
+            composite_pre,
+        }
+    }
+
+    /// The buffers written before a program of `group` that writes `buffers` and `flips`.
+    fn before(&mut self, group: Group, buffers: &[u32], flips: &[(u32, bool)]) -> u16 {
+        let name = texture_stage(group);
+        let start = match group {
+            Group::Deferred => self.deferred_pre,
+            Group::Composite | Group::Final => self.composite_pre,
+            _ => 0,
+        };
+        let before = self.stage.filter(|s| s.0 == name).map_or(start, |s| s.1);
+        let flipped = flips
+            .iter()
+            .filter(|f| f.1)
+            .fold(before, |m, f| m | 1 << f.0);
+        self.stage = Some((name, buffers.iter().fold(flipped, |m, &b| m | 1 << b)));
+        before
+    }
+}
+
 /// The stage `texture.<stage>.<sampler>` names for a program of `group`.
 fn texture_stage(group: Group) -> &'static str {
     match group {
@@ -897,7 +933,9 @@ pub(super) struct Geometry<'a> {
 /// The pass of program `p`: a quad, or `geometry` drawn by the game. `None` (with a note) when
 /// wgpu refuses it or it writes nothing. `formats` are its buffers' (for a program of the shadow
 /// buffers, buffer n is shadowcolor n); `shadow` the shadowcolor formats when the shadow pass
-/// runs.
+/// runs. `textures`: each pack texture's stage, sampler, whether it is 3D and whether it is raw.
+/// `written`: the buffers an earlier program of its stage wrote, which a pack's image named after
+/// them no longer stands in for (Iris renames a raw texture's sampler instead, so it stays).
 #[allow(clippy::too_many_arguments)]
 fn build_pass(
     device: &wgpu::Device,
@@ -908,7 +946,8 @@ fn build_pass(
     notes: &mut Vec<String>,
     geometry: Option<&Geometry<'_>>,
     custom: &[String],
-    textures: &[(String, String, bool)],
+    textures: &[(String, String, bool, bool)],
+    written: u16,
     draws: &wgpu::BindGroupLayout,
 ) -> Option<Pass> {
     let features = device.features();
@@ -943,18 +982,22 @@ fn build_pass(
     };
     for s in &interface.samplers {
         let mut src = source(&s.name, p.group.shadow(), shadow.is_some(), watershadow);
-        // The pack's own texture for this stage's sampler (`gaux3` names `colortex6` too).
+        // The pack's own texture for this stage's sampler (`gaux3` names `colortex6` too),
+        // until a program of the stage writes the buffer of that name: Bliss's
+        // `texture.composite.colortex6` is blue noise for the first composites and its bloom
+        // for the rest.
         let stage = texture_stage(p.group);
+        let replaced =
+            horizon_shaders::buffer_index(&s.name).is_some_and(|b| written & 1 << b != 0);
         let named = |n: &str| {
             n == s.name
                 || horizon_shaders::buffer_index(n)
                     .is_some_and(|b| horizon_shaders::buffer_index(&s.name) == Some(b))
         };
         let three_d = s.ty == "sampler3D";
-        if let Some(i) = textures
-            .iter()
-            .position(|(st, n, d)| st == stage && named(n) && *d == three_d)
-        {
+        if let Some(i) = textures.iter().position(|(st, n, d, raw)| {
+            st == stage && named(n) && *d == three_d && (*raw || !replaced)
+        }) {
             src = Source::Custom(i);
         } else if three_d {
             // Nothing 3D of the game's has a sampler name: a stand-in keeps the pass whole.
@@ -1233,6 +1276,7 @@ impl PackPost {
         let mut custom_textures = Vec::new();
         for t in &post.custom_textures {
             let label = format!("texture.{}.{}", t.stage, t.name);
+            let raw = !matches!(t.data, horizon_shaders::TextureData::Png(_));
             let (view, three_d) = match &t.data {
                 horizon_shaders::TextureData::Png(png) => (decode(&label, png, &mut notes), false),
                 horizon_shaders::TextureData::Raw {
@@ -1255,7 +1299,7 @@ impl PackPost {
                 }
             };
             if let Some(view) = view {
-                texture_names.push((t.stage.clone(), t.name.clone(), three_d));
+                texture_names.push((t.stage.clone(), t.name.clone(), three_d, raw));
                 custom_textures.push(view);
             }
         }
@@ -1285,25 +1329,27 @@ impl PackPost {
                 .filter(|_| i < 2)
                 .map_or(formats[i], |f| f[i])
         });
-        let mut build = |p: horizon_shaders::PostProgram, geometry: Option<&Geometry<'_>>| {
-            let in_shadow = p.group.shadow();
-            let pass = build_pass(
-                device,
-                p,
-                if in_shadow { &shadow_space } else { &formats },
-                shadow_formats.as_ref(),
-                screen,
-                &mut notes,
-                geometry,
-                &custom_names,
-                &texture_names,
-                &draws.layout,
-            )?;
-            if !in_shadow {
-                used |= pass.reads | pass.written | pass.flip;
-            }
-            Some(pass)
-        };
+        let mut build =
+            |p: horizon_shaders::PostProgram, geometry: Option<&Geometry<'_>>, written: u16| {
+                let in_shadow = p.group.shadow();
+                let pass = build_pass(
+                    device,
+                    p,
+                    if in_shadow { &shadow_space } else { &formats },
+                    shadow_formats.as_ref(),
+                    screen,
+                    &mut notes,
+                    geometry,
+                    &custom_names,
+                    &texture_names,
+                    written,
+                    &draws.layout,
+                )?;
+                if !in_shadow {
+                    used |= pass.reads | pass.written | pass.flip;
+                }
+                Some(pass)
+            };
         // Flat terrain reads `mc_Entity` from a table of the sprite layers.
         let block_ids = world
             .terrain
@@ -1321,19 +1367,19 @@ impl PackPost {
         let terrain = post
             .terrain
             .zip(terrain_geometry.as_ref())
-            .and_then(|(p, g)| build(p, Some(g)));
+            .and_then(|(p, g)| build(p, Some(g), 0));
         let water = post
             .water
             .zip(terrain_geometry.as_ref())
-            .and_then(|(p, g)| build(p, Some(g)));
+            .and_then(|(p, g)| build(p, Some(g), 0));
         let shadow_terrain = post
             .shadow
             .zip(terrain_geometry.as_ref())
-            .and_then(|(p, g)| build(p, Some(g)));
+            .and_then(|(p, g)| build(p, Some(g), 0));
         let shadow_water = post
             .shadow_water
             .zip(terrain_geometry.as_ref())
-            .and_then(|(p, g)| build(p, Some(g)));
+            .and_then(|(p, g)| build(p, Some(g), 0));
         let sky = (post.sky.is_some() || post.sky_textured.is_some()).then(|| {
             let geometry = PackSky::new(device);
             let basic = Geometry {
@@ -1344,7 +1390,7 @@ impl PackPost {
                 ids: None,
                 cull: false,
             };
-            let basic = post.sky.and_then(|p| build(p, Some(&basic)));
+            let basic = post.sky.and_then(|p| build(p, Some(&basic), 0));
             let textured = Geometry {
                 buffers: &PackSky::celestial_buffers(),
                 table: None,
@@ -1353,7 +1399,7 @@ impl PackPost {
                 ids: None,
                 cull: false,
             };
-            let textured = post.sky_textured.and_then(|p| build(p, Some(&textured)));
+            let textured = post.sky_textured.and_then(|p| build(p, Some(&textured), 0));
             Sky {
                 geometry,
                 basic,
@@ -1384,11 +1430,11 @@ impl PackPost {
         });
         let entity_passes = programs.map(|p| {
             p.zip(entity_geometry.as_ref())
-                .and_then(|(p, g)| build(p, Some(g)))
+                .and_then(|(p, g)| build(p, Some(g), 0))
         });
         let shadow_entities = shadow_programs.map(|p| {
             p.zip(entity_geometry.as_ref())
-                .and_then(|(p, g)| build(p, Some(g)))
+                .and_then(|(p, g)| build(p, Some(g), 0))
         });
         let entities = entity_vertices
             .filter(|_| (entity_passes.iter().chain(&shadow_entities)).any(Option::is_some))
@@ -1426,12 +1472,12 @@ impl PackPost {
                 ids: None,
                 cull: false,
             };
-            build(p, Some(&g)).map(|pass| (pass, geometry))
+            build(p, Some(&g), 0).map(|pass| (pass, geometry))
         });
         let weather = post
             .weather
             .zip(weather_geometry.as_ref())
-            .and_then(|(p, g)| build(p, Some(g)))
+            .and_then(|(p, g)| build(p, Some(g), 0))
             .map(|rain| {
                 let mut snow = rain.clone();
                 snow.name = format!("{} (snow)", rain.name);
@@ -1440,20 +1486,29 @@ impl PackPost {
         let clouds = post
             .clouds
             .zip(cloud_geometry.as_ref())
-            .and_then(|(p, g)| build(p, Some(g)));
+            .and_then(|(p, g)| build(p, Some(g), 0));
         // Developers' aid: `HORIZON_SHADER_PACK_SKIP=composite,final` leaves programs out.
         let skip = std::env::var("HORIZON_SHADER_PACK_SKIP").unwrap_or_default();
+        let mut writes = StageWrites::new(mask(&post.deferred_pre), mask(&post.composite_pre));
+        let mut written =
+            |p: &horizon_shaders::PostProgram| writes.before(p.group, &p.buffers, &p.flips);
         let passes: Vec<Pass> = post
             .programs
             .into_iter()
             .filter(|p| !skip.split(',').any(|s| s == p.name))
-            .filter_map(|p| build(p, None))
+            .filter_map(|p| {
+                let before = written(&p);
+                build(p, None, before)
+            })
             .collect();
         let shadow_comp: Vec<Pass> = post
             .shadow_comp
             .into_iter()
             .filter(|p| !skip.split(',').any(|s| s == p.name))
-            .filter_map(|p| build(p, None))
+            .filter_map(|p| {
+                let before = written(&p);
+                build(p, None, before)
+            })
             .collect();
         if let Some(t) = &terrain {
             notes.push(format!("terrain draws with {}", t.name));
@@ -2894,6 +2949,30 @@ impl PackPost {
 
 #[cfg(test)]
 mod tests {
+    /// Bliss's `texture.composite.colortex6` stands in for colortex6 until composite4 writes it;
+    /// `final` goes on from the composites, and each stage starts again from its `_pre` flips.
+    #[test]
+    fn a_stage_releases_the_buffers_it_wrote() {
+        let mut writes = StageWrites::new(1 << 2, 1 << 9);
+        assert_eq!(writes.before(Group::Deferred, &[1], &[]), 1 << 2);
+        assert_eq!(
+            writes.before(Group::Deferred, &[3], &[(5, true)]),
+            1 << 2 | 1 << 1
+        );
+        assert_eq!(
+            writes.before(Group::Composite, &[0, 6], &[(7, false)]),
+            1 << 9
+        );
+        assert_eq!(
+            writes.before(Group::Composite, &[3], &[]),
+            1 << 9 | 1 | 1 << 6
+        );
+        assert_eq!(
+            writes.before(Group::Final, &[], &[]),
+            1 << 9 | 1 | 1 << 6 | 1 << 3
+        );
+    }
+
     /// Half floats as GL stores RGBA32F tables uploaded as RGBA16F: exact where a half holds
     /// the value, rounded to nearest even, saturating, and subnormals kept.
     #[test]
