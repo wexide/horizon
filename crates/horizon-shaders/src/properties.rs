@@ -40,23 +40,37 @@ impl Properties {
         let mut lines = text.lines().zip(1u32..);
         while let Some((raw, number)) = lines.next() {
             let line = raw.trim();
-            let on = conditionals.active();
             if let Some(directive) = line.strip_prefix('#') {
                 if let Some((word, rest)) = split_directive(directive) {
                     out.directive(word, rest, number, &mut conditionals, &mut macros);
                 }
                 continue;
             }
-            // Continuation lines belong to their entry even inside a skipped branch.
+            if !conditionals.active() {
+                continue;
+            }
+            // Directives run before lines join, as Iris preprocesses the file first: a `\` goes
+            // on past directives, comments and the lines of a skipped branch. Bliss ends
+            // `block.56=` (its leaves) with one right before `#endif`.
             let mut logical = line.to_owned();
-            while ends_with_continuation(&logical) {
+            'join: while ends_with_continuation(&logical) {
                 logical.pop();
-                match lines.next() {
-                    Some((next, _)) => logical.push_str(next.trim()),
-                    None => break,
+                loop {
+                    let Some((next, n)) = lines.next() else {
+                        break 'join;
+                    };
+                    let next = next.trim();
+                    if let Some(directive) = next.strip_prefix('#') {
+                        if let Some((word, rest)) = split_directive(directive) {
+                            out.directive(word, rest, n, &mut conditionals, &mut macros);
+                        }
+                    } else if conditionals.active() {
+                        logical.push_str(next);
+                        break;
+                    }
                 }
             }
-            if !on || logical.is_empty() {
+            if logical.is_empty() {
                 continue;
             }
             match logical.split_once('=') {
@@ -180,6 +194,20 @@ mod tests {
             ]
         );
         assert_eq!(p.entry("sliders").unwrap().line, 4);
+    }
+
+    /// Bliss's `block.56`: each branch's line ends with `\`, the list goes on after `#endif`.
+    #[test]
+    fn continuations_run_past_directives() {
+        let p = read(
+            "#ifdef BOES\nids=a b \\\n#else\nids=c d \\\n#endif\n e \\\n# f \\\n g\nafter=1\n\
+             #ifdef SHADOWS\nlist=x \\\n#else\n skipped \\\n#endif\n y\n",
+        );
+        assert_eq!(
+            pairs(&p),
+            [("ids", "c d e g"), ("after", "1"), ("list", "x y")]
+        );
+        assert!(p.notes.is_empty(), "{:?}", p.notes);
     }
 
     #[test]
