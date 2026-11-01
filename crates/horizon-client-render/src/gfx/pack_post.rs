@@ -508,7 +508,28 @@ fn volume_texture(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     label: &str,
+    size: [u32; 3],
+    texels: &[u8],
+) -> wgpu::TextureView {
+    raw_texture(
+        device,
+        queue,
+        label,
+        size,
+        true,
+        wgpu::TextureFormat::Rgba8Unorm,
+        texels,
+    )
+}
+
+/// A 2D (depth 1) or 3D texture of `format` (`Rgba8Unorm` or `Rgba16Float`) from `texels`.
+fn raw_texture(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    label: &str,
     [width, height, depth]: [u32; 3],
+    three_d: bool,
+    format: wgpu::TextureFormat,
     texels: &[u8],
 ) -> wgpu::TextureView {
     let size = wgpu::Extent3d {
@@ -521,22 +542,80 @@ fn volume_texture(
         size,
         mip_level_count: 1,
         sample_count: 1,
-        dimension: wgpu::TextureDimension::D3,
-        format: wgpu::TextureFormat::Rgba8Unorm,
+        dimension: if three_d {
+            wgpu::TextureDimension::D3
+        } else {
+            wgpu::TextureDimension::D2
+        },
+        format,
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
+    let texel = format.block_copy_size(None).unwrap_or(4);
     queue.write_texture(
         tex.as_image_copy(),
         texels,
         wgpu::TexelCopyBufferLayout {
             offset: 0,
-            bytes_per_row: Some(width * 4),
+            bytes_per_row: Some(width * texel),
             rows_per_image: Some(height),
         },
         size,
     );
     tex.create_view(&Default::default())
+}
+
+/// Texels of `channels` little-endian `f32`s as `Rgba16Float` (missing colour channels 0,
+/// alpha 1): half floats filter on every device, `f32` only with a feature.
+fn expand_rgba16f(bytes: &[u8], channels: u8, texels: usize) -> Vec<u8> {
+    let c = usize::from(channels);
+    let f = |b: &[u8]| f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+    bytes
+        .chunks_exact(c * 4)
+        .take(texels)
+        .flat_map(|t| {
+            let at = |i: usize| (i < c).then(|| f(&t[i * 4..]));
+            [
+                at(0).unwrap_or(0.0),
+                at(1).unwrap_or(0.0),
+                at(2).unwrap_or(0.0),
+                at(3).unwrap_or(1.0),
+            ]
+        })
+        .flat_map(|v| half_bits(v).to_le_bytes())
+        .collect()
+}
+
+/// `x` as an IEEE half float, rounded to nearest even; out of range saturates to infinity.
+fn half_bits(x: f32) -> u16 {
+    let b = x.to_bits();
+    let sign = ((b >> 16) & 0x8000) as u16;
+    let exp = ((b >> 23) & 0xff) as i32;
+    let man = b & 0x007f_ffff;
+    if exp == 0xff {
+        return sign | 0x7c00 | if man != 0 { 0x200 } else { 0 };
+    }
+    let e = exp - 127 + 15;
+    if e >= 0x1f {
+        return sign | 0x7c00;
+    }
+    let (value, shift) = if e <= 0 {
+        if e < -10 {
+            return sign;
+        }
+        (man | 0x0080_0000, (14 - e) as u32)
+    } else {
+        ((e as u32) << 23 | man, 13)
+    };
+    let half = value >> shift;
+    let rest = value & ((1 << shift) - 1);
+    let midpoint = 1 << (shift - 1);
+    let rounded = if rest > midpoint || (rest == midpoint && half & 1 == 1) {
+        half + 1
+    } else {
+        half
+    };
+    sign | rounded as u16
 }
 
 /// Texels of `channels` bytes as RGBA8, as GL reads `RED`, `RG` and `RGB` (missing colour
@@ -1160,15 +1239,18 @@ impl PackPost {
                     size,
                     three_d,
                     channels,
+                    float,
                     bytes,
                 } => {
                     let texels = size.iter().map(|&n| n as usize).product();
-                    let rgba = expand_rgba(bytes, *channels, texels);
-                    let view = if *three_d {
-                        volume_texture(device, queue, &label, *size, &rgba)
+                    let (format, rgba) = if *float {
+                        let f = wgpu::TextureFormat::Rgba16Float;
+                        (f, expand_rgba16f(bytes, *channels, texels))
                     } else {
-                        sized_texture(device, queue, &label, [size[0], size[1]], &rgba)
+                        let f = wgpu::TextureFormat::Rgba8Unorm;
+                        (f, expand_rgba(bytes, *channels, texels))
                     };
+                    let view = raw_texture(device, queue, &label, *size, *three_d, format, &rgba);
                     (Some(view), *three_d)
                 }
             };
@@ -2812,6 +2894,22 @@ impl PackPost {
 
 #[cfg(test)]
 mod tests {
+    /// Half floats as GL stores RGBA32F tables uploaded as RGBA16F: exact where a half holds
+    /// the value, rounded to nearest even, saturating, and subnormals kept.
+    #[test]
+    fn floats_become_half_floats() {
+        assert_eq!(half_bits(1.0), 0x3c00);
+        assert_eq!(half_bits(0.5), 0x3800);
+        assert_eq!(half_bits(-2.0), 0xc000);
+        assert_eq!(half_bits(65504.0), 0x7bff);
+        assert_eq!(half_bits(1.0e6), 0x7c00);
+        assert_eq!(half_bits(2f32.powi(-24)), 0x0001);
+        assert_eq!(half_bits(1.0 + 2f32.powi(-11)), 0x3c00, "ties go to even");
+        assert_eq!(half_bits(1.0 + 3.0 * 2f32.powi(-11)), 0x3c02, "ties go to even");
+        let texel = expand_rgba16f(&[0, 0, 128, 63, 0, 0, 0, 64], 2, 1);
+        assert_eq!(texel, [0x00, 0x3c, 0x00, 0x40, 0x00, 0x00, 0x00, 0x3c]);
+    }
+
     use super::*;
     use wgpu::TextureFormat as T;
 

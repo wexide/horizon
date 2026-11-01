@@ -534,8 +534,8 @@ pub struct CustomTexture {
 }
 
 /// What a custom texture holds: a PNG, or raw texels (`path TEXTURE_3D RGBA8 128 128 128 RGBA
-/// UNSIGNED_BYTE`) of one byte per channel, `channels` per texel, rows first, then slices; a
-/// 2D texture has a depth of 1.
+/// UNSIGNED_BYTE`) of one byte per channel (`FLOAT`: a little-endian `f32`), `channels` per
+/// texel, rows first, then slices; a 2D texture has a depth of 1.
 #[derive(Clone, Debug, PartialEq)]
 pub enum TextureData {
     Png(Vec<u8>),
@@ -543,6 +543,7 @@ pub enum TextureData {
         size: [u32; 3],
         three_d: bool,
         channels: u8,
+        float: bool,
         bytes: Vec<u8>,
     },
 }
@@ -566,7 +567,15 @@ fn custom_textures(loader: &mut Loader<'_>) {
         };
         let target = match rest.split_once('.') {
             None if rest == "noise" => None,
-            Some((stage, name)) if STAGES.contains(&stage) => Some((stage, name)),
+            // `colortex8.0` and `colortex8.1`: textures of one name, a program's sampler taking
+            // the one of its own kind (IterationT: a 3D table for `sampler3D`, a PNG for
+            // `sampler2D`).
+            Some((stage, name)) if STAGES.contains(&stage) => Some((
+                stage,
+                name.split_once('.')
+                    .filter(|(_, n)| n.chars().all(|c| c.is_ascii_digit()))
+                    .map_or(name, |(n, _)| n),
+            )),
             _ => continue,
         };
         let data = texture_data(loader.pack, &e.value);
@@ -614,9 +623,14 @@ fn texture_data(pack: &Pack, value: &str) -> Option<TextureData> {
         _ => return None,
     };
     let dims = if three_d { 3 } else { 2 };
-    if rest.len() != 2 + dims + 2 || rest[2 + dims + 1] != "UNSIGNED_BYTE" {
+    if rest.len() != 2 + dims + 2 {
         return None;
     }
+    let float = match rest[2 + dims + 1] {
+        "UNSIGNED_BYTE" => false,
+        "FLOAT" => true,
+        _ => return None,
+    };
     let mut size = [1u32; 3];
     for (d, word) in size.iter_mut().zip(&rest[2..2 + dims]) {
         *d = word.parse().ok().filter(|&n| n > 0)?;
@@ -630,13 +644,15 @@ fn texture_data(pack: &Pack, value: &str) -> Option<TextureData> {
     };
     let bytes = pack.read(path)?;
     let texels = size.iter().map(|&n| n as usize).product::<usize>();
-    if bytes.len() < texels * channels as usize {
+    let width = if float { 4 } else { 1 };
+    if bytes.len() < texels * channels as usize * width {
         return None;
     }
     Some(TextureData::Raw {
         size,
         three_d,
         channels,
+        float,
         bytes,
     })
 }
@@ -1254,6 +1270,7 @@ mod tests {
                         size: [2, 2, 2],
                         three_d: true,
                         channels: 3,
+                        float: false,
                         bytes: b"abcdefghijklmnopqrstuvwx".to_vec(),
                     },
                 },
