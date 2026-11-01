@@ -246,6 +246,9 @@ pub struct Post {
     pub clouds: Option<PostProgram>,
     /// `clouds=off` (3.2): the pack draws its own sky, so the game draws no clouds.
     pub clouds_off: bool,
+    /// `rain.depth=true`: rain and snow write the depth buffer (by default they do not, so the
+    /// composites see what is behind them; Bliss draws its rain from colortex9 alone).
+    pub rain_depth: bool,
     /// `texture.noise`: the PNG that replaces the game's `noisetex`.
     pub noise_texture: Option<Vec<u8>>,
     /// `texture.<stage>.<sampler>`: PNGs that replace a sampler in a stage's programs.
@@ -334,6 +337,7 @@ pub fn load_post(
         particles: None,
         clouds: None,
         clouds_off: false,
+        rain_depth: false,
         noise_texture: None,
         custom_textures: Vec::new(),
         weather: None,
@@ -501,6 +505,9 @@ pub fn load_post(
     loader.post.particles = particles;
     loader.post.clouds = clouds;
     loader.post.clouds_off = properties.get("clouds").is_some_and(|v| v.trim() == "off");
+    loader.post.rain_depth = properties
+        .get("rain.depth")
+        .is_some_and(|v| v.trim() == "true");
     custom_textures(&mut loader);
     loader.post.weather = weather;
     loader.post.hand = hand;
@@ -1171,6 +1178,10 @@ mod tests {
         assert!(post.clouds.is_none() && !post.clouds_off);
         let off = Properties::parse("clouds=off\n", &macros);
         assert!(load_post(&pack, "", &off, &macros, &inputs).clouds_off);
+        // Rain and snow leave the depth buffer alone unless the pack asks.
+        assert!(!post.rain_depth);
+        let depth = Properties::parse("rain.depth=true\n", &macros);
+        assert!(load_post(&pack, "", &depth, &macros, &inputs).rain_depth);
         // The hand falls back to gbuffers_textured and does not blend.
         let hand = post.hand.as_ref().unwrap();
         assert_eq!(
